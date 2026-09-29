@@ -1,0 +1,677 @@
+diff -ruN a/include/triton/Analysis/AxisInfo.h b/include/triton/Analysis/AxisInfo.h
+--- a/include/triton/Analysis/AxisInfo.h	2026-09-30 01:18:25.363355922 +0800
++++ b/include/triton/Analysis/AxisInfo.h	2026-09-28 02:41:25.172846459 +0800
+@@ -181,7 +181,7 @@
+       initialize(funcOp);
+       funcOp.walk([&](CallOpInterface callOp) {
+         auto callee =
+-            dyn_cast<FunctionOpInterface>(callOp.resolveCallable(&symbolTable));
++            dyn_cast<FunctionOpInterface>(callOp.resolveCallableInTable(&symbolTable));
+         update(callOp, callee);
+       });
+     }
+diff -ruN a/include/triton/Analysis/Utility.h b/include/triton/Analysis/Utility.h
+--- a/include/triton/Analysis/Utility.h	2026-09-30 01:18:25.363355922 +0800
++++ b/include/triton/Analysis/Utility.h	2026-09-28 02:41:25.274847215 +0800
+@@ -303,7 +303,7 @@
+     moduleOp.walk([&](Operation *op) {
+       auto caller = op->getParentOfType<FunctionOpInterface>();
+       if (auto callOp = dyn_cast<CallOpInterface>(op)) {
+-        auto *callee = callOp.resolveCallable(&symbolTable);
++        auto *callee = callOp.resolveCallableInTable(&symbolTable);
+         auto funcOp = dyn_cast_or_null<FunctionOpInterface>(callee);
+         if (funcOp) {
+           graph[caller].emplace_back(
+diff -ruN a/include/triton/Dialect/Triton/IR/Dialect.h b/include/triton/Dialect/Triton/IR/Dialect.h
+--- a/include/triton/Dialect/Triton/IR/Dialect.h	2026-09-30 01:18:25.365420140 +0800
++++ b/include/triton/Dialect/Triton/IR/Dialect.h	2026-09-28 02:36:55.535423019 +0800
+@@ -24,7 +24,7 @@
+ namespace triton {
+ 
+ struct GlobalMemory : public SideEffects::Resource::Base<GlobalMemory> {
+-  StringRef getName() final { return "<GlobalMemory>"; }
++  StringRef getName() const final { return "<GlobalMemory>"; }
+ };
+ 
+ class DialectInferLayoutInterface
+diff -ruN a/include/triton/Dialect/Triton/IR/TritonDialect.td b/include/triton/Dialect/Triton/IR/TritonDialect.td
+--- a/include/triton/Dialect/Triton/IR/TritonDialect.td	2026-09-30 01:18:25.365420140 +0800
++++ b/include/triton/Dialect/Triton/IR/TritonDialect.td	2026-09-28 02:35:02.041266606 +0800
+@@ -37,7 +37,6 @@
+ 
+   let hasConstantMaterializer = 1;
+   let useDefaultTypePrinterParser = 1;
+-  let usePropertiesForAttributes = 1;
+ }
+ 
+ include "triton/Dialect/Triton/IR/TritonTypes.td"
+diff -ruN a/include/triton/Dialect/Triton/IR/TritonOps.td b/include/triton/Dialect/Triton/IR/TritonOps.td
+--- a/include/triton/Dialect/Triton/IR/TritonOps.td	2026-09-30 01:18:25.365420140 +0800
++++ b/include/triton/Dialect/Triton/IR/TritonOps.td	2026-09-29 22:33:53.778290011 +0800
+@@ -658,6 +658,23 @@
+     let hasVerifier = 1;
+ }
+ 
++// Dot plus a multiplicative epilogue. The scale is applied once, outside any
++// K loop introduced by triton-tile-dot.
++def TT_FusedDotMulOp : TT_Op<"fused_dot_mul", [Pure, AllTypesMatch<["c", "scale", "d"]>]> {
++  let summary = "dot with a multiply epilogue";
++  let arguments = (ins
++    TT_TensorOrMemDesc:$a,
++    TT_TensorOrMemDesc:$b,
++    TT_FpIntTensor:$c,
++    TT_FpIntTensor:$scale
++  );
++  let results = (outs TT_FpIntTensor:$d);
++  let assemblyFormat = [{
++    $a `,` $b `,` $c `,` $scale attr-dict `:`
++    type($a) `*` type($b) `,` type($c) `,` type($scale) `->` type($d)
++  }];
++}
++
+ //
+ // Reduce Op
+ //
+@@ -958,6 +975,13 @@
+       return getOperandsMutable();
+     }
+ 
++    ArrayAttr getArgAttrsAttr() { return {}; }
++    ArrayAttr getResAttrsAttr() { return {}; }
++    void setArgAttrsAttr(ArrayAttr) {}
++    void setResAttrsAttr(ArrayAttr) {}
++    Attribute removeArgAttrsAttr() { return {}; }
++    Attribute removeResAttrsAttr() { return {}; }
++
+   }];
+ 
+   let assemblyFormat = [{
+@@ -1083,7 +1107,7 @@
+   let arguments = (ins Variadic<AnyType>:$srcs);
+ 
+   let builders = [OpBuilder<(ins), [{
+-    build($_builder, $_state, std::nullopt);
++    build($_builder, $_state, ::mlir::ValueRange{});
+   }]>];
+ 
+   let assemblyFormat = "attr-dict ($srcs^ `:` type($srcs))?";
+diff -ruN a/include/triton/Dialect/Triton/Transforms/Passes.h b/include/triton/Dialect/Triton/Transforms/Passes.h
+--- a/include/triton/Dialect/Triton/Transforms/Passes.h	2026-09-30 01:18:25.366318024 +0800
++++ b/include/triton/Dialect/Triton/Transforms/Passes.h	2026-09-29 21:58:44.893581654 +0800
+@@ -10,9 +10,16 @@
+ 
+ std::unique_ptr<Pass> createReorderBroadcastPass();
+ std::unique_ptr<Pass> createRewriteTensorPointerPass();
++std::unique_ptr<Pass> createAnnotateDotStagesPass(int32_t targetSm = 70);
++std::unique_ptr<Pass> createFuseDotEpiloguePass();
++std::unique_ptr<Pass> createLowerFusedDotMulPass();
++std::unique_ptr<Pass> createTileDotPass(int32_t targetSm = 70);
+ 
+ } // namespace triton
+ 
++#define GEN_PASS_DECL
++#include "triton/Dialect/Triton/Transforms/Passes.h.inc"
++
+ #define GEN_PASS_REGISTRATION
+ #include "triton/Dialect/Triton/Transforms/Passes.h.inc"
+ 
+diff -ruN a/include/triton/Dialect/Triton/Transforms/Passes.td b/include/triton/Dialect/Triton/Transforms/Passes.td
+--- a/include/triton/Dialect/Triton/Transforms/Passes.td	2026-09-30 01:18:25.366318024 +0800
++++ b/include/triton/Dialect/Triton/Transforms/Passes.td	2026-09-29 21:58:44.892628885 +0800
+@@ -28,6 +28,43 @@
+   let dependentDialects = ["mlir::triton::TritonDialect"];
+ }
+ 
++def TritonAnnotateDotStages : Pass<"triton-annotate-dot-stages", "mlir::ModuleOp"> {
++  let summary = "Stamp triton_llm.num_stages on tt.dot";
++  let description = [{
++    Walk tt.dot and set triton_llm.num_stages. sm < 80 gets 2 stages;
++    sm >= 80 gets 3. This is the pass this repo adds on the tt dialect.
++  }];
++  let constructor = "mlir::triton::createAnnotateDotStagesPass()";
++  let options = [
++    Option<"targetSm", "sm", "int32_t", "70", "compute capability">
++  ];
++  let dependentDialects = ["mlir::triton::TritonDialect"];
++}
++
++def TritonFuseDotEpilogue : Pass<"triton-fuse-dot-epilogue", "mlir::ModuleOp"> {
++  let summary = "Fold arith.mulf of a tt.dot into tt.fused_dot_mul";
++  let constructor = "mlir::triton::createFuseDotEpiloguePass()";
++  let dependentDialects = ["mlir::triton::TritonDialect"];
++}
++
++def TritonLowerFusedDotMul : Pass<"triton-lower-fused-dot-mul", "mlir::ModuleOp"> {
++  let summary = "Lower tt.fused_dot_mul to tt.dot and arith.mulf";
++  let constructor = "mlir::triton::createLowerFusedDotMulPass()";
++  let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
++}
++
++def TritonTileDot : Pass<"triton-tile-dot", "mlir::ModuleOp"> {
++  let summary = "Tile the K dimension of tt.dot with a fixed strategy";
++  let constructor = "mlir::triton::createTileDotPass()";
++  let options = [
++    Option<"targetSm", "sm", "int32_t", "70", "compute capability">
++  ];
++  let dependentDialects = [
++    "mlir::triton::TritonDialect", "mlir::arith::ArithDialect",
++    "mlir::scf::SCFDialect", "mlir::tensor::TensorDialect"
++  ];
++}
++
+ def TritonRewriteTensorPointer : Pass</*cli-arg*/"triton-rewrite-tensor-pointer", /*Op*/"mlir::ModuleOp"> {
+   let summary = "Rewrite load/stores with tensor pointers into legacy load/stores";
+   let description = [{
+diff -ruN a/include/triton/Dialect/TritonGPU/IR/Dialect.h b/include/triton/Dialect/TritonGPU/IR/Dialect.h
+--- a/include/triton/Dialect/TritonGPU/IR/Dialect.h	2026-09-30 01:18:25.366602191 +0800
++++ b/include/triton/Dialect/TritonGPU/IR/Dialect.h	2026-09-28 02:36:55.899424017 +0800
+@@ -20,7 +20,7 @@
+ namespace gpu {
+ 
+ struct SharedMemory : public SideEffects::Resource::Base<SharedMemory> {
+-  StringRef getName() final { return "<SharedMemory>"; }
++  StringRef getName() const final { return "<SharedMemory>"; }
+ };
+ 
+ unsigned getTotalElemsPerThread(Type type);
+diff -ruN a/include/triton/Dialect/TritonGPU/IR/TritonGPUDialect.td b/include/triton/Dialect/TritonGPU/IR/TritonGPUDialect.td
+--- a/include/triton/Dialect/TritonGPU/IR/TritonGPUDialect.td	2026-09-30 01:18:25.366602191 +0800
++++ b/include/triton/Dialect/TritonGPU/IR/TritonGPUDialect.td	2026-09-28 02:35:02.044266606 +0800
+@@ -48,7 +48,6 @@
+ 
+   let useDefaultTypePrinterParser = 1;
+   let useDefaultAttributePrinterParser = 1;
+-  let usePropertiesForAttributes = 1;
+ }
+ 
+ #endif
+diff -ruN a/include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td b/include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td
+--- a/include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td	2026-09-30 01:18:25.366602191 +0800
++++ b/include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td	2026-09-28 02:42:55.434565745 +0800
+@@ -104,7 +104,11 @@
+   let builders = [
+       OpBuilder<(ins "Value":$src, "Value":$result,
+                      "triton::CacheModifier":$cache,
+-                     "triton::EvictionPolicy":$evict, "bool":$isVolatile)>,
++                     "triton::EvictionPolicy":$evict, "bool":$isVolatile),
++      [{
++        build($_builder, $_state, src, result, /*mask=*/Value(), /*other=*/Value(),
++              cache, evict, isVolatile);
++      }]>
+   ];
+ 
+   let results = (outs TTG_AsyncToken:$token);
+diff -ruN a/lib/Analysis/ReshapeDecomposition.cpp b/lib/Analysis/ReshapeDecomposition.cpp
+--- a/lib/Analysis/ReshapeDecomposition.cpp	1970-01-01 08:00:00.000000000 +0800
++++ b/lib/Analysis/ReshapeDecomposition.cpp	2026-09-29 21:08:16.614094189 +0800
+@@ -0,0 +1,46 @@
++#include "triton/Analysis/Utility.h"
++
++namespace mlir {
++
++SmallVector<std::pair<SmallVector<int64_t>, SmallVector<int64_t>>>
++getReshapeDecomposition(ArrayRef<int64_t> srcShape,
++                        ArrayRef<int64_t> dstShape) {
++  SmallVector<std::pair<SmallVector<int64_t>, SmallVector<int64_t>>> ret;
++
++  if (srcShape.empty()) {
++    assert(dstShape.empty());
++    return ret;
++  }
++  ret.push_back({});
++
++  int srcIdx = 0;
++  int dstIdx = 0;
++  int srcNElems = 1;
++  int dstNElems = 1;
++  while (srcIdx < static_cast<int>(srcShape.size()) ||
++         dstIdx < static_cast<int>(dstShape.size())) {
++    if (srcNElems < dstNElems ||
++        (srcIdx < static_cast<int>(srcShape.size()) && srcNElems == 1) ||
++        (srcIdx < static_cast<int>(srcShape.size()) &&
++         srcShape[srcIdx] == 1)) {
++      assert(srcIdx < static_cast<int>(srcShape.size()));
++      srcNElems *= srcShape[srcIdx];
++      ret.back().first.push_back(srcIdx);
++      srcIdx++;
++    } else if (dstNElems < srcNElems ||
++               (dstIdx < static_cast<int>(dstShape.size()) &&
++                dstShape[dstIdx] == 1)) {
++      assert(dstIdx < static_cast<int>(dstShape.size()));
++      dstNElems *= dstShape[dstIdx];
++      ret.back().second.push_back(dstIdx);
++      dstIdx++;
++    } else {
++      ret.push_back({});
++      srcNElems = 1;
++      dstNElems = 1;
++    }
++  }
++  return ret;
++}
++
++} // namespace mlir
+diff -ruN a/lib/Analysis/Utility.cpp b/lib/Analysis/Utility.cpp
+--- a/lib/Analysis/Utility.cpp	2026-09-30 01:18:25.369110557 +0800
++++ b/lib/Analysis/Utility.cpp	2026-09-29 21:08:03.331164082 +0800
+@@ -319,44 +319,6 @@
+   return elementSizeInBytes * getScratchSizeInElems();
+ }
+ 
+-SmallVector<std::pair<SmallVector<int64_t>, SmallVector<int64_t>>>
+-getReshapeDecomposition(ArrayRef<int64_t> srcShape,
+-                        ArrayRef<int64_t> dstShape) {
+-  SmallVector<std::pair<SmallVector<int64_t>, SmallVector<int64_t>>> ret;
+-
+-  if (srcShape.empty()) {
+-    assert(dstShape.empty());
+-    return ret;
+-  }
+-  ret.push_back({});
+-
+-  int srcIdx = 0;
+-  int dstIdx = 0;
+-  int srcNElems = 1;
+-  int dstNElems = 1;
+-  while (srcIdx < srcShape.size() || dstIdx < dstShape.size()) {
+-    if (srcNElems < dstNElems || //
+-        (srcIdx < srcShape.size() && srcNElems == 1) ||
+-        (srcIdx < srcShape.size() && srcShape[srcIdx] == 1)) {
+-      assert(srcIdx < srcShape.size());
+-      srcNElems *= srcShape[srcIdx];
+-      ret.back().first.push_back(srcIdx);
+-      srcIdx++;
+-    } else if (dstNElems < srcNElems ||
+-               (dstIdx < dstShape.size() && dstShape[dstIdx] == 1)) {
+-      assert(dstIdx < dstShape.size());
+-      dstNElems *= dstShape[dstIdx];
+-      ret.back().second.push_back(dstIdx);
+-      dstIdx++;
+-    } else {
+-      ret.push_back({});
+-      srcNElems = 1;
+-      dstNElems = 1;
+-    }
+-  }
+-  return ret;
+-}
+-
+ BlockedEncodingAttr ScanLoweringHelper::getEncoding() {
+   return cast<BlockedEncodingAttr>(srcEncoding);
+ }
+diff -ruN a/lib/Dialect/Triton/IR/Ops.cpp b/lib/Dialect/Triton/IR/Ops.cpp
+--- a/lib/Dialect/Triton/IR/Ops.cpp	2026-09-30 01:18:25.373416827 +0800
++++ b/lib/Dialect/Triton/IR/Ops.cpp	2026-09-28 02:37:48.794599525 +0800
+@@ -15,7 +15,7 @@
+ void LoadOp::getEffects(
+     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+         &effects) {
+-  effects.emplace_back(MemoryEffects::Read::get(), getPtr(),
++  effects.emplace_back(MemoryEffects::Read::get(), &getPtrMutable(),
+                        triton::GlobalMemory::get());
+   if (getIsVolatile())
+     effects.emplace_back(MemoryEffects::Write::get(),
+@@ -205,7 +205,7 @@
+ 
+ LogicalResult TransOp::inferReturnTypes(
+     MLIRContext *context, std::optional<Location> location, ValueRange operands,
+-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
++    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
+     SmallVectorImpl<Type> &inferredReturnTypes) {
+   // type is the same as the input
+   auto argTy = cast<TensorOrMemDesc>(operands[0].getType());
+@@ -259,7 +259,7 @@
+ LogicalResult
+ DotOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
+                         ValueRange operands, DictionaryAttr attributes,
+-                        OpaqueProperties properties, RegionRange regions,
++                        PropertyRef properties, RegionRange regions,
+                         SmallVectorImpl<Type> &inferredReturnTypes) {
+   // type is the same as the accumulator
+   auto accTy = cast<RankedTensorType>(operands[2].getType());
+@@ -379,7 +379,7 @@
+ 
+ LogicalResult ReduceOp::inferReturnTypes(
+     MLIRContext *context, std::optional<Location> location, ValueRange operands,
+-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
++    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
+     SmallVectorImpl<Type> &inferredReturnTypes) {
+   Properties *prop = properties.as<Properties *>();
+   int axis = prop->axis.getInt();
+@@ -515,7 +515,7 @@
+ LogicalResult
+ ScanOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
+                          ValueRange operands, DictionaryAttr attributes,
+-                         OpaqueProperties properties, RegionRange regions,
++                         PropertyRef properties, RegionRange regions,
+                          SmallVectorImpl<Type> &inferredReturnTypes) {
+   for (auto arg : operands)
+     inferredReturnTypes.push_back(arg.getType());
+@@ -551,7 +551,7 @@
+ //-- ExpandDimsOp --
+ LogicalResult ExpandDimsOp::inferReturnTypes(
+     MLIRContext *context, std::optional<Location> loc, ValueRange operands,
+-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
++    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
+     SmallVectorImpl<Type> &inferredReturnTypes) {
+   // infer shape
+   auto arg = operands[0];
+@@ -792,8 +792,8 @@
+   if (argAttrs.empty())
+     return;
+   assert(type.getNumInputs() == argAttrs.size());
+-  function_interface_impl::addArgAndResultAttrs(
+-      builder, state, argAttrs, /*resultAttrs=*/std::nullopt,
++  call_interface_impl::addArgAndResultAttrs(
++      builder, state, argAttrs, /*resultAttrs=*/ArrayRef<DictionaryAttr>{},
+       getArgAttrsAttrName(state.name), getResAttrsAttrName(state.name));
+ }
+ 
+@@ -877,7 +877,7 @@
+ LogicalResult
+ JoinOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
+                          ValueRange operands, DictionaryAttr attributes,
+-                         OpaqueProperties properties, RegionRange regions,
++                         PropertyRef properties, RegionRange regions,
+                          SmallVectorImpl<Type> &inferredReturnTypes) {
+   // These should have been checked by tablegen-generated code.
+   assert(operands.size() == 2);
+@@ -909,7 +909,7 @@
+ // -- SplitOp --
+ LogicalResult SplitOp::inferReturnTypes(
+     MLIRContext *context, std::optional<Location> location, ValueRange operands,
+-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
++    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
+     SmallVectorImpl<Type> &inferredReturnTypes) {
+   // These should have been checked by tablegen-generated code.
+   assert(operands.size() == 1);
+diff -ruN a/lib/Dialect/Triton/Transforms/AnnotateDotStages.cpp b/lib/Dialect/Triton/Transforms/AnnotateDotStages.cpp
+--- a/lib/Dialect/Triton/Transforms/AnnotateDotStages.cpp	1970-01-01 08:00:00.000000000 +0800
++++ b/lib/Dialect/Triton/Transforms/AnnotateDotStages.cpp	2026-09-29 21:08:03.331164082 +0800
+@@ -0,0 +1,36 @@
++#include "mlir/IR/BuiltinAttributes.h"
++#include "mlir/IR/BuiltinOps.h"
++#include "mlir/Pass/Pass.h"
++#include "triton/Dialect/Triton/IR/Dialect.h"
++
++#define GEN_PASS_DECL_TRITONANNOTATEDOTSTAGES
++#define GEN_PASS_DEF_TRITONANNOTATEDOTSTAGES
++#include "triton/Dialect/Triton/Transforms/Passes.h.inc"
++
++using namespace mlir;
++using namespace mlir::triton;
++
++namespace {
++
++class AnnotateDotStagesPass
++    : public ::impl::TritonAnnotateDotStagesBase<AnnotateDotStagesPass> {
++public:
++  using ::impl::TritonAnnotateDotStagesBase<AnnotateDotStagesPass>::TritonAnnotateDotStagesBase;
++
++  void runOnOperation() override {
++    int64_t stages = targetSm >= 80 ? 3 : 2;
++    OpBuilder builder(&getContext());
++    IntegerAttr attr = builder.getI64IntegerAttr(stages);
++    getOperation().walk([&](DotOp dot) { dot->setAttr("triton_llm.num_stages", attr); });
++  }
++};
++
++} // namespace
++
++namespace mlir::triton {
++std::unique_ptr<Pass> createAnnotateDotStagesPass(int32_t targetSm) {
++  TritonAnnotateDotStagesOptions options;
++  options.targetSm = targetSm;
++  return std::make_unique<AnnotateDotStagesPass>(options);
++}
++} // namespace mlir::triton
+diff -ruN a/lib/Dialect/Triton/Transforms/CMakeLists.txt b/lib/Dialect/Triton/Transforms/CMakeLists.txt
+--- a/lib/Dialect/Triton/Transforms/CMakeLists.txt	2026-09-30 01:18:25.373416827 +0800
++++ b/lib/Dialect/Triton/Transforms/CMakeLists.txt	2026-09-30 00:30:32.286592711 +0800
+@@ -3,7 +3,9 @@
+ add_public_tablegen_target(TritonCombineIncGen)
+ 
+ add_triton_library(TritonTransforms
++  AnnotateDotStages.cpp
+   Combine.cpp
++  FuseAndTileDot.cpp
+   ReorderBroadcast.cpp
+   RewriteTensorPointer.cpp
+ 
+@@ -14,5 +16,7 @@
+   LINK_LIBS PUBLIC
+   MLIRPass
+   MLIRTransformUtils
++  MLIRSCFDialect
++  MLIRTensorDialect
+   TritonIR
+ )
+diff -ruN a/lib/Dialect/Triton/Transforms/FuseAndTileDot.cpp b/lib/Dialect/Triton/Transforms/FuseAndTileDot.cpp
+--- a/lib/Dialect/Triton/Transforms/FuseAndTileDot.cpp	1970-01-01 08:00:00.000000000 +0800
++++ b/lib/Dialect/Triton/Transforms/FuseAndTileDot.cpp	2026-09-29 22:01:26.742075387 +0800
+@@ -0,0 +1,172 @@
++#include "mlir/Dialect/Arith/IR/Arith.h"
++#include "mlir/Dialect/SCF/IR/SCF.h"
++#include "mlir/Dialect/Tensor/IR/Tensor.h"
++#include "mlir/IR/BuiltinOps.h"
++#include "mlir/Pass/Pass.h"
++#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
++#include "triton/Dialect/Triton/IR/Dialect.h"
++
++#define GEN_PASS_DECL_TRITONFUSEDOTEPILOGUE
++#define GEN_PASS_DEF_TRITONFUSEDOTEPILOGUE
++#define GEN_PASS_DECL_TRITONLOWERFUSEDDOTMUL
++#define GEN_PASS_DEF_TRITONLOWERFUSEDDOTMUL
++#define GEN_PASS_DECL_TRITONTILEDOT
++#define GEN_PASS_DEF_TRITONTILEDOT
++#include "triton/Dialect/Triton/Transforms/Passes.h.inc"
++
++using namespace mlir;
++using namespace mlir::triton;
++
++namespace {
++
++// Same candidate list as python/triton_llm/arch/tiling.py. The last candidate
++// that fits shared memory and the stage cap is the strategy. This is not
++// autotune: one sm maps to one tile.
++struct GemmTile {
++  int64_t blockK;
++  int64_t stages;
++};
++
++GemmTile gemmTileForSm(int32_t sm) {
++  int64_t limit = sm >= 90 ? 228 * 1024 : sm >= 80 ? 164 * 1024 : 96 * 1024;
++  int stagesCap = sm >= 80 ? 3 : 2;
++  struct Cand {
++    int bm, bn, bk, stages;
++  };
++  static constexpr Cand kCands[] = {
++      {64, 64, 32, 2}, {64, 128, 32, 2}, {128, 128, 32, 2},
++      {128, 128, 64, 2}, {128, 128, 64, 3},
++  };
++  GemmTile chosen{32, 2};
++  for (Cand c : kCands) {
++    if (c.stages > stagesCap)
++      continue;
++    int64_t bytes = int64_t(c.stages) * (c.bm * c.bk + c.bn * c.bk) * 2;
++    if (bytes <= limit)
++      chosen = GemmTile{c.bk, c.stages};
++  }
++  return chosen;
++}
++
++class FuseDotEpiloguePass
++    : public ::impl::TritonFuseDotEpilogueBase<FuseDotEpiloguePass> {
++public:
++  void runOnOperation() override {
++    RewritePatternSet patterns(&getContext());
++    patterns.add(+[](arith::MulFOp mul, PatternRewriter &rewriter) -> LogicalResult {
++      Value lhs = mul.getLhs();
++      Value rhs = mul.getRhs();
++      auto dot = lhs.getDefiningOp<DotOp>();
++      Value scale = rhs;
++      if (!dot) {
++        dot = rhs.getDefiningOp<DotOp>();
++        scale = lhs;
++      }
++      if (!dot || !dot.getResult().hasOneUse())
++        return failure();
++      if (scale.getType() != dot.getResult().getType())
++        return failure();
++      auto fused = rewriter.create<FusedDotMulOp>(
++          mul.getLoc(), dot.getResult().getType(), dot.getA(), dot.getB(),
++          dot.getC(), scale);
++      rewriter.replaceOp(mul, fused.getResult());
++      rewriter.eraseOp(dot);
++      return success();
++    });
++    if (failed(applyPatternsGreedily(getOperation(), FrozenRewritePatternSet(std::move(patterns)))))
++      signalPassFailure();
++  }
++};
++
++class LowerFusedDotMulPass
++    : public ::impl::TritonLowerFusedDotMulBase<LowerFusedDotMulPass> {
++public:
++  void runOnOperation() override {
++    RewritePatternSet patterns(&getContext());
++    patterns.add(+[](FusedDotMulOp op, PatternRewriter &rewriter) -> LogicalResult {
++      auto dot = rewriter.create<DotOp>(op.getLoc(), op.getA(), op.getB(), op.getC());
++      auto mul = rewriter.create<arith::MulFOp>(op.getLoc(), dot.getResult(), op.getScale());
++      rewriter.replaceOp(op, mul.getResult());
++      return success();
++    });
++    if (failed(applyPatternsGreedily(getOperation(), FrozenRewritePatternSet(std::move(patterns)))))
++      signalPassFailure();
++  }
++};
++
++class TileDotPass : public ::impl::TritonTileDotBase<TileDotPass> {
++public:
++  using ::impl::TritonTileDotBase<TileDotPass>::TritonTileDotBase;
++
++  void runOnOperation() override {
++    GemmTile tile = gemmTileForSm(targetSm);
++    SmallVector<DotOp> dots;
++    getOperation().walk([&](DotOp dot) { dots.push_back(dot); });
++    for (DotOp dot : dots) {
++      if (failed(tileDot(dot, tile)))
++        continue;
++    }
++  }
++
++  LogicalResult tileDot(DotOp dot, GemmTile tile) {
++    auto aTy = dyn_cast<RankedTensorType>(dot.getA().getType());
++    auto bTy = dyn_cast<RankedTensorType>(dot.getB().getType());
++    auto cTy = dyn_cast<RankedTensorType>(dot.getC().getType());
++    if (!aTy || !bTy || !cTy || aTy.getRank() != 2 || bTy.getRank() != 2)
++      return failure();
++    if (!aTy.hasStaticShape() || !bTy.hasStaticShape())
++      return failure();
++    int64_t m = aTy.getDimSize(0);
++    int64_t k = aTy.getDimSize(1);
++    int64_t kB = bTy.getDimSize(0);
++    int64_t n = bTy.getDimSize(1);
++    if (k != kB || k <= tile.blockK || k % tile.blockK != 0)
++      return failure();
++    if (cTy.getRank() != 2 || cTy.getDimSize(0) != m || cTy.getDimSize(1) != n)
++      return failure();
++
++    OpBuilder builder(dot);
++    Location loc = dot.getLoc();
++    Value lb = builder.create<arith::ConstantIndexOp>(loc, 0);
++    Value ub = builder.create<arith::ConstantIndexOp>(loc, k);
++    Value step = builder.create<arith::ConstantIndexOp>(loc, tile.blockK);
++    auto forOp = builder.create<scf::ForOp>(
++        loc, lb, ub, step, ValueRange{dot.getC()},
++        [&](OpBuilder &b, Location bodyLoc, Value iv, ValueRange iterArgs) {
++          SmallVector<OpFoldResult> strides{b.getIndexAttr(1), b.getIndexAttr(1)};
++          Value aTile = b.create<tensor::ExtractSliceOp>(
++              bodyLoc, dot.getA(),
++              SmallVector<OpFoldResult>{b.getIndexAttr(0), iv},
++              SmallVector<OpFoldResult>{b.getIndexAttr(m), b.getIndexAttr(tile.blockK)},
++              strides);
++          Value bTile = b.create<tensor::ExtractSliceOp>(
++              bodyLoc, dot.getB(),
++              SmallVector<OpFoldResult>{iv, b.getIndexAttr(0)},
++              SmallVector<OpFoldResult>{b.getIndexAttr(tile.blockK), b.getIndexAttr(n)},
++              strides);
++          Value acc = b.create<DotOp>(bodyLoc, aTile, bTile, iterArgs[0]).getResult();
++          b.create<scf::YieldOp>(bodyLoc, acc);
++        });
++    forOp->setAttr("triton_llm.block_k", builder.getI64IntegerAttr(tile.blockK));
++    forOp->setAttr("triton_llm.num_stages", builder.getI64IntegerAttr(tile.stages));
++    dot.replaceAllUsesWith(forOp.getResult(0));
++    dot.erase();
++    return success();
++  }
++};
++
++} // namespace
++
++namespace mlir::triton {
++std::unique_ptr<Pass> createFuseDotEpiloguePass() {
++  return std::make_unique<FuseDotEpiloguePass>();
++}
++std::unique_ptr<Pass> createLowerFusedDotMulPass() {
++  return std::make_unique<LowerFusedDotMulPass>();
++}
++std::unique_ptr<Pass> createTileDotPass(int32_t targetSm) {
++  TritonTileDotOptions options;
++  options.targetSm = targetSm;
++  return std::make_unique<TileDotPass>(options);
++}
++} // namespace mlir::triton
+diff -ruN a/lib/Dialect/TritonGPU/IR/Dialect.cpp b/lib/Dialect/TritonGPU/IR/Dialect.cpp
+--- a/lib/Dialect/TritonGPU/IR/Dialect.cpp	2026-09-30 01:18:25.374581555 +0800
++++ b/lib/Dialect/TritonGPU/IR/Dialect.cpp	2026-09-28 02:41:06.546710770 +0800
+@@ -2875,7 +2875,7 @@
+   effects.emplace_back(MemoryEffects::Allocate::get(),
+                        mlir::triton::gpu::SharedMemory::get());
+   if (getSrc())
+-    effects.emplace_back(MemoryEffects::Write::get(), getResult(),
++    effects.emplace_back(MemoryEffects::Write::get(), getOperation()->getResult(0),
+                          mlir::triton::gpu::SharedMemory::get());
+ }
+ 
+@@ -2883,7 +2883,7 @@
+ void LocalLoadOp::getEffects(
+     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+         &effects) {
+-  effects.emplace_back(MemoryEffects::Read::get(), getSrc(),
++  effects.emplace_back(MemoryEffects::Read::get(), &getSrcMutable(),
+                        mlir::triton::gpu::SharedMemory::get());
+ }
+ 
+@@ -2891,7 +2891,7 @@
+ void LocalStoreOp::getEffects(
+     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+         &effects) {
+-  effects.emplace_back(MemoryEffects::Write::get(), getDst(),
++  effects.emplace_back(MemoryEffects::Write::get(), &getDstMutable(),
+                        mlir::triton::gpu::SharedMemory::get());
+ }
+ 
+@@ -2899,9 +2899,9 @@
+ void AsyncCopyGlobalToLocalOp::getEffects(
+     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+         &effects) {
+-  effects.emplace_back(MemoryEffects::Read::get(), getSrc(),
++  effects.emplace_back(MemoryEffects::Read::get(), &getSrcMutable(),
+                        mlir::triton::GlobalMemory::get());
+-  effects.emplace_back(MemoryEffects::Write::get(), getResult(),
++  effects.emplace_back(MemoryEffects::Write::get(), getOperation()->getResult(0),
+                        mlir::triton::gpu::SharedMemory::get());
+ }
+ 
+diff -ruN a/python/src/passes.cc b/python/src/passes.cc
+--- a/python/src/passes.cc	2026-09-30 01:18:25.380081123 +0800
++++ b/python/src/passes.cc	2026-09-29 21:08:03.331164082 +0800
+@@ -39,6 +39,7 @@
+   ADD_PASS_WRAPPER_0("add_reorder_broadcast", createReorderBroadcastPass);
+   ADD_PASS_WRAPPER_0("add_rewrite_tensor_pointer",
+                      createRewriteTensorPointerPass);
++  ADD_PASS_WRAPPER_1("add_annotate_dot_stages", createAnnotateDotStagesPass, int);
+   ADD_PASS_WRAPPER_4("add_convert_to_ttgpuir",
+                      createConvertTritonToTritonGPUPass, const std::string &,
+                      int, int, int);

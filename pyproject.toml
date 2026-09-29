@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "triton-llm"
+version = "0.2.0"
+description = "Triton LLM kernels, Triton-MLIR (tt) passes and a CUTLASS runtime for Volta"
+requires-python = ">=3.10"
+dependencies = [
+  "torch==2.5.1",
+  "triton==3.1.0",
+  "numpy",
+  "pytest>=7.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+pythonpath = ["python"]

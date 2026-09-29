@@ -1,0 +1,12 @@
+build/
+.venv
+__pycache__/
+*.pyc
+.pytest_cache/
+compile_commands.json
+_deps/
+.cache/
+*.so
+*.o
+*.a
+artifacts/
