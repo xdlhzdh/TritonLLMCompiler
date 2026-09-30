@@ -11,7 +11,7 @@ Triton 3.1 路线的 LLM 算子与编译器开发仓库。默认目标是 NVIDIA
 | 本仓库的 C++ opt | `./build/bin/tt-opt` | 跑手写的 TTIR pass。链接 LLVM 23，不能读 TTGIR |
 | Triton 源码 | submodule [`third_party/triton`](third_party/patches/README.md) | 不进本仓库的 git 历史。v3.1.0（`cf34004b`）。补丁在 [`third_party/patches/`](third_party/patches/README.md)，配置时打进 `build/triton-patched` |
 
-这四条互不调用。改一个文件之后哪条路径会重新编译，见 [`docs/triton_mlir_path.md`](docs/triton_mlir_path.md) 第 10 节。
+这四条互不调用。改一个文件之后哪条路径会重新编译，见 [`docs/triton_mlir_path.md`](docs/triton_mlir_path.md) 第 6 节。
 
 ## 从这里开始
 
@@ -133,7 +133,7 @@ python -m triton_llm.tt_opt --sm 70 --num-warps 4 --num-stages 2 --num-ctas 1 \
 
 `tt.fused_dot_mul` 由补丁加进 `TritonOps.td`，`c`、`scale`、`d` 的类型必须相同（`AllTypesMatch`）。切分用固定表，不用 `@triton.autotune`。已安装的 JIT 不会跑这些 pass。补丁里的 `passes.cc` 写了 `add_annotate_dot_stages`，要重编 Triton 并装回 `.venv` 之后才会出现在 `libtriton.so` 里。融合和切分还没有对应的 `add_*`。
 
-[`tests/shell/run_tt_opt_tests.sh`](tests/shell/run_tt_opt_tests.sh) 执行 `tests/tt/*.mlir` 里的 `// RUN:`。它先把单词 `tt-opt` 换成 `python -m triton_llm.tt_opt`，再把 `TT_OPT_CPP` 换成 `build/bin/tt-opt`。手写 pass 的测试要写 `TT_OPT_CPP`。新增 pass 的步骤见 [`docs/triton_mlir_path.md`](docs/triton_mlir_path.md) 第 7.4 节。
+[`tests/shell/run_tt_opt_tests.sh`](tests/shell/run_tt_opt_tests.sh) 执行 `tests/tt/*.mlir` 里的 `// RUN:`。它先把单词 `tt-opt` 换成 `python -m triton_llm.tt_opt`，再把 `TT_OPT_CPP` 换成 `build/bin/tt-opt`。手写 pass 的测试要写 `TT_OPT_CPP`。新增 pass 的步骤见 [`docs/triton_mlir_path.md`](docs/triton_mlir_path.md) 第 5.1 节。
 
 ## IR 样例
 
