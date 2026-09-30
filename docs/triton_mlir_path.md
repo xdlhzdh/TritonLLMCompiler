@@ -86,17 +86,17 @@ Python 和这份 `.so` 之间只有三种调用：
 
 ### 2.2 本仓库停在测试这一半
 
-`build/bin/tt-opt` 对应上表里的 `triton-opt`，但只包含四个 TTIR pass。这四个 pass 的 C++、`Passes.td`、对 `.mlir` 的 FileCheck，以及固定的 tile 表，写法和上游一致。用户调用 `@triton.jit` 时，这四个 pass 不会执行。
+`build/bin/tt-opt` 对应上表里的 `triton-opt`，注册了五个手写 pass。其中四个改 TTIR。`triton-chip-rcp-to-llvm` 的整条路径见第 4.5 节。tile 用固定表。用户调用 `@triton.jit` 时，这些 pass 不会执行。
 
 | 工业界一次 Triton 构建 | 本仓库现在 |
 |---|---|
-| `triton-opt` 注册全部方言和 pass，能从 TTIR 走到 LLVM | `build/bin/tt-opt` 只注册四个 TTIR pass。不能读 `triton_gpu`，不生成 PTX |
+| `triton-opt` 注册全部方言和 pass，能从 TTIR 走到 LLVM | `build/bin/tt-opt` 只注册这五个 pass。不能读 `triton_gpu`，不生成 PTX |
 | lit 调用上游的 `bin/triton-opt` | `tests/shell/run_tt_opt_tests.sh` 调用 `build/bin/tt-opt`。本仓库不编译 `bin/triton-opt.cpp`，也不运行 lit |
-| 同一份 `.cpp` 链进 `libtriton.so` | 四个 pass 只在 `build/bin/tt-opt` 里。`.venv` 里的 `libtriton.so` 是 pip 的 Triton 3.1.0，不含它们 |
-| `passes.cc` 的 `add_*` 被 `make_ttir` / `make_ttgir` 调用，并且这份代码在已安装的 `.so` 里 | 补丁里的 `passes.cc` 只有 `add_annotate_dot_stages`。融合和切分没有 `add_*`。`make_ttir` 不调用它们。已安装的 `.so` 没有用这份补丁重编 |
+| 同一份 `.cpp` 链进 `libtriton.so` | 这些 pass 只在 `build/bin/tt-opt` 里。`.venv` 里的 `libtriton.so` 是 pip 的 Triton 3.1.0，不含它们 |
+| `passes.cc` 的 `add_*` 被 `make_ttir` / `make_ttgir` / `make_llir` 调用，并且这份代码在已安装的 `.so` 里 | `passes.cc` 里有 `add_annotate_dot_stages` 和 `add_lower_chip_rcp`。融合和切分没有 `add_*`。补丁的 `make_llir` 调用了 `add_lower_chip_rcp`。已安装的 `compiler.py` 和 `.so` 都没有这次改动 |
 | `libtriton.so` 和 `triton-opt` 链接同一份 LLVM | `.venv` 的 `.so` 用 Triton 3.1.0 在 `cmake/llvm-hash.txt` 里固定的 LLVM。`tt-opt` 用 `/opt/torch-mlir` 的 LLVM 23。两边只能传递 IR 文本 |
 
-因此，`@triton.jit` 编译出的 cubin 里没有这四个 pass 改过的 IR。要让 `@triton.jit` 执行它们：把 pass 的 `.cpp` 编进 Triton，在 `passes.cc` 里为四个 pass 都加上 `add_*`，在 `make_ttir` 里调用，再用这次构建产出的 `libtriton.so` 替换 `.venv` 里的那一份。`build/bin/tt-opt` 仍然可以对 `.mlir` 做 FileCheck。替换 `.so` 这一步不能省。
+因此，`@triton.jit` 编译出的 cubin 里没有这些 pass 改过的 IR。要让 `@triton.jit` 执行它们：把 pass 的 `.cpp` 编进 Triton，在 `passes.cc` 里补上融合和切分还没有的 `add_*`，在对应的 stage 里调用，再用这次构建产出的 `libtriton.so` 替换 `.venv` 里的那一份。`build/bin/tt-opt` 仍然可以对 `.mlir` 做 FileCheck。替换 `.so` 这一步不能省。`tl.chip_rcp` 还要额外经过第 4.5 节里的 TTIR→TTGIR。
 
 ## 3. 本仓库里的三个程序
 
@@ -104,11 +104,11 @@ Python 和这份 `.so` 之间只有三种调用：
 |---|---|---|
 | `.venv` 里的 Triton 3.1.0 | 安装包：Python 文件、`libtriton.so`、`ptxas` | 会。`@triton.jit` 编译 kernel 时用的就是这一份 |
 | `python -m triton_llm.tt_opt` | 本仓库的 Python 脚本。它调用上一行那个 `.so` 里已经有的 pass | 不会。输入是一份 `.mlir`，用来执行 `.so` 里已经有的 pass |
-| `build/bin/tt-opt` | 本仓库编译出的可执行文件，只包含手写的 TTIR pass | 不会。不能解析 TTGIR，也不生成 PTX |
+| `build/bin/tt-opt` | 本仓库编译出的可执行文件。含手写的 TTIR pass，以及把 `tt.chip_rcp` 降成 `llvm.inline_asm` 的 pass | 不会。不能解析 TTGIR，也不生成 PTX |
 
 Triton 源码是 submodule `third_party/triton`（v3.1.0，`cf34004`），不进本仓库的提交。本地改动在 `third_party/patches/`。CMake 把 submodule 复制到 `build/triton-patched`，打上补丁，再编 `tt-opt`。哪些目录参与这次编译、哪些只供阅读，见 [`third_party/patches/README.md`](../third_party/patches/README.md)。
 
-这三个程序不会互相调用。`build/bin/tt-opt` 链接 LLVM 23。`.venv` 里的 `libtriton.so` 链接的是 Triton 3.1.0 在 `cmake/llvm-hash.txt` 里固定的那一版 LLVM。这两个二进制不能传递 C++ 对象，只能传递 IR 文本。`tt.fused_dot_mul` 是补丁增加的 op，已安装的 `libtriton.so` 解析不了它。要把 `build/bin/tt-opt` 的输出再交给 `python -m triton_llm.tt_opt`，先加上 `--triton-lower-fused-dot-mul`，把这个 op 展开回 `tt.dot`。
+这三个程序不会互相调用。`build/bin/tt-opt` 链接 LLVM 23。`.venv` 里的 `libtriton.so` 链接的是 Triton 3.1.0 在 `cmake/llvm-hash.txt` 里固定的那一版 LLVM。这两个二进制不能传递 C++ 对象，只能传递 IR 文本。`tt.fused_dot_mul` 和 `tt.chip_rcp` 都是补丁增加的 op，已安装的 `libtriton.so` 解析不了它们。要把 `build/bin/tt-opt` 里融合之后的 IR 再交给 `python -m triton_llm.tt_opt`，先加上 `--triton-lower-fused-dot-mul`，把 `tt.fused_dot_mul` 展开回 `tt.dot`。`tt.chip_rcp` 要先用 `--triton-chip-rcp-to-llvm` 降掉。
 
 ## 4. 从 Python 函数到 cubin
 
@@ -138,7 +138,7 @@ Triton 源码是 submodule `third_party/triton`（v3.1.0，`cf34004`），不进
 
 [`tests/python/test_frontend_middle.py`](../tests/python/test_frontend_middle.py) 检查这张表。
 
-要增加一个用户可以调用的 `tl.xxx`：在 `TritonOps.td` 加 op，在 `ir.cc` 加 `create_xxx`，在 `language/core.py` 和 `semantic.py` 加 `@builtin`，然后重新编译 Triton 并安装新的 `libtriton.so`。用已有 op 组成新函数时，写一个 `@triton.jit` 辅助函数即可，不用重新编译。`tt.fused_dot_mul` 由 pass 生成，前端没有对应的 `tl.*`。
+用已有 op 组成新函数时，写一个 `@triton.jit` 辅助函数即可，不用重新编译。`tt.fused_dot_mul` 由 pass 生成，前端没有对应的 `tl.*`。新增内建 `tl.chip_rcp` 的接法和后续转换见第 4.5 节。
 
 ### 4.2 `make_ttir`
 
@@ -184,15 +184,34 @@ triton_gpu.convert_layout
 
 仍是 `compiler.py` 里的三个函数：
 
-- `make_llir`：`allocate-shared-memory`、`TritonGPUToLLVM`（`third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp`）、`nvgpu-to-llvm` 等，再 `llvm.to_module` 和 O3。Volta 的 `mma.sync` 在 `DotOpToLLVM/MMAv1.cpp`，Hopper 的 `wgmma` 在 `WGMMA.cpp`。
+- `make_llir`：`allocate-shared-memory`、`TritonGPUToLLVM`（`third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp`）、`nvgpu-to-llvm` 等，再 `llvm.to_module` 和 O3。Volta 的 `mma.sync` 在 `DotOpToLLVM/MMAv1.cpp`，Hopper 的 `wgmma` 在 `WGMMA.cpp`。`llvm.to_module` 的输出才是 LLVM IR 文本。补丁在这里多了一次调用，见第 4.5 节。
 - `make_ptx`：`llvm.translate_to_asm`，triple `nvptx64-nvidia-cuda`。这是 LLVM 的 NVPTX 后端。
 - `make_cubin`：调用 wheel 里的 `ptxas`。没有对应的 Triton pass。
 
-本仓库不修改这三个函数。
+本仓库不修改 `make_ptx` 和 `make_cubin`。
+
+### 4.5 `tl.chip_rcp`：从 AST 到 LLVM IR
+
+`tt.chip_rcp` 是 `tt` 方言上的 op，属于 TTIR。它不是新方言，也不是 `triton_gpu`。
+
+AST 里没有新的节点类型。新增的是 Python 内建函数 `tl.chip_rcp`。`code_generator.py` 的 `visit_Call` 不用改：它见到 `@builtin` 就把 `_builder` 传进这个函数。内建如果不是函数调用，而是一种新语法，才改 `visit_Call`。`tl.exp` 也是这条接法，只是 `ir.cc` 建的是 `math.exp`，指令在更后面的 `ElementwiseOpToLLVM` 里发出。
+
+| 步骤 | 阶段 | 文件 | 这一步之后的 IR |
+|---|---|---|---|
+| 1 | AST | `language/math.py` 的 `chip_rcp`，`language/__init__.py` 导出为 `tl.chip_rcp` | 还没有 IR。函数只接受 fp32，调用 `_builder.create_chip_rcp` |
+| 2 | 第一份 TTIR | `ir.cc` 的 `create_chip_rcp`，op 定义是 `TritonOps.td` 的 `TT_ChipRcpOp` | `tt.chip_rcp %x : tensor<...xf32> -> tensor<...xf32>`。一个 f32 张量进，一个 f32 张量出 |
+| 3 | `make_ttir` | 第 4.2 节那一串 pass | 仍是 `tt.chip_rcp`。这些 pass 没有针对它的 pattern，张量上还没有 layout |
+| 4 | `make_ttgir` | `convert-triton-to-tritongpu`（`TritonToTritonGPUPass.cpp`） | 给张量加上 layout。op 仍叫 `tt.chip_rcp`，还是 `tt` 方言。`TritonGPUConversion.cpp` 里，没有 layout 的张量是非法的。`tt.chip_rcp` 没有 pattern，转换失败，到不了第 5 步 |
+| 5 | `make_llir` | `ElementwiseOpToLLVM.cpp`，然后 `llvm.to_module` | 上游的 `math.exp` 留到这一步才拆成标量，由 `ExpOpConversionApprox` 发出 `ex2.approx.f32`。`chip.rcp.approx.f32` 应写在同一处。`llvm.to_module` 再把 MLIR 的 LLVM dialect 变成 LLVM IR 文本。之后是第 4.4 节的 `make_ptx`、`make_cubin` |
+| 6 | 本仓库实际跑的 lowering | `LowerChipRcpToLLVM.cpp`，flag `--triton-chip-rcp-to-llvm` | 跳过第 4、5 步，直接在 TTIR 上改写。静态形状、rank 至少为 1 的 f32 张量，每个元素做 `tensor.extract`、`llvm.inline_asm`（汇编串 `chip.rcp.approx.f32 $0, $1`，约束 `=f,f`）、`tensor.insert`。`llvm.inline_asm` 是 MLIR 的 LLVM dialect，还不是 LLVM IR 文本 |
+
+第 6 步的绑定在补丁的 `passes.cc`：`add_lower_chip_rcp`。补丁的 `make_llir` 在 `add_to_llvmir` 之前调用它。已安装的 `compiler.py` 和 `libtriton.so` 没有这次改动。`@triton.jit` 写 `tl.chip_rcp` 时，失败发生在第 2 步：`.venv` 的 `libtriton.so` 没有 `create_chip_rcp`。就算重编并装回这份 `.so`，第 4 步仍然会失败，第 6 步的那一行调用不会被执行到。
+
+现在能跑的检查是 [`tests/tt/chip_rcp.mlir`](../tests/tt/chip_rcp.mlir)。输入是手写的 TTIR，`build/bin/tt-opt --triton-chip-rcp-to-llvm` 执行第 6 步。它不跑 `make_ttir`、`convert-triton-to-tritongpu`、`llvm.to_module` 和 `ptxas`。
 
 ## 5. 本仓库的手写 pass：`build/bin/tt-opt`
 
-入口是 [`compiler/tt-opt.cpp`](../compiler/tt-opt.cpp)。它和补丁里的 `AnnotateDotStages.cpp`、`FuseAndTileDot.cpp` 编成 `build/bin/tt-opt`，链接静态库 `TritonIR` 和 LLVM 23。不加载 `libtriton.so`。
+入口是 [`compiler/tt-opt.cpp`](../compiler/tt-opt.cpp)。它和补丁里的 `AnnotateDotStages.cpp`、`FuseAndTileDot.cpp`、`LowerChipRcpToLLVM.cpp` 编成 `build/bin/tt-opt`，链接静态库 `TritonIR` 和 LLVM 23。不加载 `libtriton.so`。
 
 ```bash
 cmake -B build -DTRITON_LLM_CUDA_ARCH=70
@@ -200,7 +219,7 @@ cmake --build build --target tt-opt -j"$(nproc)"
 ./build/bin/tt-opt --help
 ```
 
-`build/bin/tt-opt` 能解析的方言有 `tt`、`arith`、`func`、`math`、`scf`、`cf`、`tensor`、`llvm`。没有 `triton_gpu`，所以不能读 TTGIR。`--help` 里列出的 pass 就是这里注册的：`canonicalize` 和下面四个。
+`build/bin/tt-opt` 能解析的方言有 `tt`、`arith`、`func`、`math`、`scf`、`cf`、`tensor`、`llvm`。没有 `triton_gpu`，所以不能读 TTGIR。`--help` 里列出的 pass 就是这里注册的：`canonicalize` 和下面五个。
 
 | flag | 作用 |
 |---|---|
@@ -208,6 +227,7 @@ cmake --build build --target tt-opt -j"$(nproc)"
 | `--triton-fuse-dot-epilogue` | 单次使用的 `tt.dot` 乘一个同类型标量，改写成 `tt.fused_dot_mul` |
 | `--triton-lower-fused-dot-mul` | 展开回 `tt.dot` 和循环外的乘法 |
 | `--triton-tile-dot` | K 能被 `BLOCK_K` 整除时，改成 `scf.for` + `tensor.extract_slice` + 内层 `tt.dot` |
+| `--triton-chip-rcp-to-llvm` | 静态形状的 f32 `tt.chip_rcp` 改成逐元素的 `llvm.inline_asm`，汇编串是 `chip.rcp.approx.f32` |
 
 `tt.fused_dot_mul` 加在 `tt` 方言上，不是新方言。操作数 `c`、`scale` 和结果的类型必须相同。
 
@@ -215,7 +235,7 @@ tile 的候选写在 `FuseAndTileDot.cpp` 的 `gemmTileForSm`，和 [`arch/tilin
 
 这些 flag 来自补丁改过的 `Passes.td`。补丁打完之后，文件在 `build/triton-patched/include/triton/Dialect/Triton/Transforms/Passes.td`。命令行写成 `--triton-annotate-dot-stages=sm=90` 时，MLIR 先用默认的 sm 构造 pass，再把 `sm=90` 写进这个 pass 的选项。
 
-补丁里的 `passes.cc` 写了 `add_annotate_dot_stages`，已安装的 `libtriton.so` 里没有这个函数。融合和切分没有 `add_*`。`@triton.jit` 编译 kernel 时不会执行这四个 pass。和工业界差在哪、要补哪几步，见第 2.2 节。submodule 里的 `compiler.py` 保持和已安装的 Triton 相同的 `make_ttir` 顺序，这样 `python -m triton_llm.tt_opt --make-ttir` 和 `@triton.jit` 用的是同一串 pass。
+补丁里的 `passes.cc` 写了 `add_annotate_dot_stages` 和 `add_lower_chip_rcp`。已安装的 `libtriton.so` 里没有这两个函数。融合和切分没有 `add_*`。`make_ttir` 的顺序和已安装的 Triton 相同，所以 `python -m triton_llm.tt_opt --make-ttir` 和 `@triton.jit` 用的是同一串 TTIR pass。`tl.chip_rcp` 见第 4.5 节。
 
 ### 5.1 再加一个 pass
 
@@ -283,4 +303,4 @@ MLIR_ENABLE_DUMP=1 TRITON_ALWAYS_COMPILE=1 PYTHONPATH=python python scripts/dump
 - software pipeline、fence、TMA。V100 上不会跑。
 - 自定义 `BaseBackend`。现在用的是 wheel 里的 NVIDIA backend。
 - 编译并运行上游的 `triton-opt` 和 lit。源码在 submodule 的 `bin/` 和 `test/`，测试仍用上面的 shell 脚本读 `// RUN:`。
-- 把四个手写 pass 编进 `libtriton.so` 并在 `make_ttir` 里调用。对照见第 2.2 节。
+- 把手写 pass 编进 `libtriton.so` 并在对应 stage 里调用。对照见第 2.2 节。`tl.chip_rcp` 见第 4.5 节。

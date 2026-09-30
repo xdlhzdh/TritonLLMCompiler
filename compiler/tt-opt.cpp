@@ -16,6 +16,7 @@ std::unique_ptr<Pass> createAnnotateDotStagesPass(int32_t targetSm = 70);
 std::unique_ptr<Pass> createFuseDotEpiloguePass();
 std::unique_ptr<Pass> createLowerFusedDotMulPass();
 std::unique_ptr<Pass> createTileDotPass(int32_t targetSm = 70);
+std::unique_ptr<Pass> createLowerChipRcpToLLVMPass();
 }
 
 int main(int argc, char **argv) {
@@ -36,6 +37,9 @@ int main(int argc, char **argv) {
   });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::triton::createTileDotPass();
+  });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::triton::createLowerChipRcpToLLVMPass();
   });
   return mlir::asMainReturnCode(
       mlir::MlirOptMain(argc, argv, "tt dialect opt\n", registry));

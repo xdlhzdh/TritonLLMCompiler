@@ -47,7 +47,9 @@ submodule 的工作区保持上游原样。改 pass 时改 `build/triton-patched
 
 `Traits.cpp` 会调用 `TritonGPUDialect::getNumWarps`，所以要带上那三份 GPU 的 `.cpp`。`tt-opt` 的解析器没有注册 `triton_gpu`，仍然不能读 TTGIR。
 
-直接编进 `tt-opt` 的是补丁新增的 `AnnotateDotStages.cpp`、`FuseAndTileDot.cpp`，加上本仓库的 `compiler/tt-opt.cpp`。
+直接编进 `tt-opt` 的是补丁新增的 `AnnotateDotStages.cpp`、`FuseAndTileDot.cpp`、`LowerChipRcpToLLVM.cpp`，加上本仓库的 `compiler/tt-opt.cpp`。
+
+补丁还改了 `python/triton/language/math.py`、`python/triton/language/__init__.py`、`python/src/ir.cc` 和 `third_party/nvidia/backend/compiler.py` 的 `make_llir`。这几处是 `tl.chip_rcp` 的前端和 backend 挂钩。`build/bin/tt-opt` 不加载它们。已安装的 `@triton.jit` 读的是 `.venv` 里的同名文件，所以现在调用 `tl.chip_rcp` 不会进到 `create_chip_rcp`。
 
 ## 哪些只供阅读
 
@@ -55,9 +57,9 @@ submodule 里其余文件不参与这次编译，用来对照上游 Triton 3.1.0
 
 | 路径 | 读它是为了看什么 |
 |---|---|
-| `python/triton/compiler/`、`python/triton/language/`、`python/triton/runtime/` | AST 怎么变成 TTIR，`@triton.jit` 怎么启动编译 |
-| `third_party/nvidia/backend/compiler.py` | `make_ttir` / `make_ttgir` 的 pass 顺序 |
-| `python/src/passes.cc`、`ir.cc`、`llvm.cc` | Python 怎么通过 pybind 调用 C++ |
+| `python/triton/compiler/`、`python/triton/language/`、`python/triton/runtime/` | AST 怎么变成 TTIR。`tl.chip_rcp` 的改动在补丁打进 `build/triton-patched` 之后的 `language/math.py` 和 `__init__.py` |
+| `third_party/nvidia/backend/compiler.py` | `make_ttir` / `make_ttgir` 的 pass 顺序。补丁只在 `make_llir` 里多调用了一次 `add_lower_chip_rcp` |
+| `python/src/passes.cc`、`ir.cc`、`llvm.cc` | Python 怎么通过 pybind 调用 C++。`create_chip_rcp` 和 `add_lower_chip_rcp` 在补丁里 |
 | `lib/Conversion/`、`lib/Dialect/TritonGPU/Transforms/`、`lib/Dialect/TritonNvidiaGPU/` | TTIR 降到 TTGIR，以及布局、流水、TMA |
 | `third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/` | TTGIR 降到 LLVM。Volta 的 `mma.sync` 在 `DotOpToLLVM/MMAv1.cpp` |
 | `bin/triton-opt.cpp`、`test/` | 上游的 opt 工具和 lit。本仓库不编译、不运行它们 |

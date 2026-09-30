@@ -125,13 +125,14 @@ python -m triton_llm.tt_opt --sm 70 --num-warps 4 --num-stages 2 --num-ctas 1 \
 
 | Flag | 源码 | 作用 |
 |---|---|---|
-| `--canonicalize` | 上游 MLIR | 与下面四个一起注册 |
+| `--canonicalize` | 上游 MLIR | 与下面五个一起注册 |
 | `--triton-annotate-dot-stages` | `AnnotateDotStages.cpp` | 每个 `tt.dot` 写 `triton_llm.num_stages`：`sm<80` 为 2，否则 3 |
 | `--triton-fuse-dot-epilogue` | `FuseAndTileDot.cpp` | 单次使用的 `tt.dot` 与同类型 `arith.mulf` 收成 `tt.fused_dot_mul` |
 | `--triton-lower-fused-dot-mul` | 同上 | 展开回 `tt.dot` 和循环外的 `arith.mulf` |
 | `--triton-tile-dot` | 同上 | 静态二维 `tt.dot` 在 K 能被 `BLOCK_K` 整除时改写成 `scf.for` + `tensor.extract_slice`。`triton_llm.block_k` 和 `triton_llm.num_stages` 写在 `scf.for` 上 |
+| `--triton-chip-rcp-to-llvm` | `LowerChipRcpToLLVM.cpp` | 静态形状的 f32 `tt.chip_rcp` 降成逐元素 `llvm.inline_asm`，指令文本是 `chip.rcp.approx.f32` |
 
-`tt.fused_dot_mul` 由补丁加进 `TritonOps.td`，`c`、`scale`、`d` 的类型必须相同（`AllTypesMatch`）。切分用固定表，不用 `@triton.autotune`。已安装的 JIT 不会跑这些 pass。补丁里的 `passes.cc` 写了 `add_annotate_dot_stages`，要重编 Triton 并装回 `.venv` 之后才会出现在 `libtriton.so` 里。融合和切分还没有对应的 `add_*`。
+`tt.fused_dot_mul` 由补丁加进 `TritonOps.td`，`c`、`scale`、`d` 的类型必须相同（`AllTypesMatch`）。切分用固定表，不用 `@triton.autotune`。已安装的 JIT 不会跑这些 pass。补丁里的 `passes.cc` 写了 `add_annotate_dot_stages` 和 `add_lower_chip_rcp`，要重编 Triton 并装回 `.venv` 之后才会出现在 `libtriton.so` 里。融合和切分还没有对应的 `add_*`。`tl.chip_rcp` 从 AST 到 LLVM IR 的步骤见 [`docs/triton_mlir_path.md`](docs/triton_mlir_path.md) 第 4.5 节。
 
 [`tests/shell/run_tt_opt_tests.sh`](tests/shell/run_tt_opt_tests.sh) 执行 `tests/tt/*.mlir` 里的 `// RUN:`。它先把单词 `tt-opt` 换成 `python -m triton_llm.tt_opt`，再把 `TT_OPT_CPP` 换成 `build/bin/tt-opt`。手写 pass 的测试要写 `TT_OPT_CPP`。新增 pass 的步骤见 [`docs/triton_mlir_path.md`](docs/triton_mlir_path.md) 第 5.1 节。
 

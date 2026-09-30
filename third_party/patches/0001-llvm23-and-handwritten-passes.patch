@@ -1,6 +1,6 @@
 diff -ruN a/include/triton/Analysis/AxisInfo.h b/include/triton/Analysis/AxisInfo.h
---- a/include/triton/Analysis/AxisInfo.h	2026-09-30 01:18:25.363355922 +0800
-+++ b/include/triton/Analysis/AxisInfo.h	2026-09-28 02:41:25.172846459 +0800
+--- a/include/triton/Analysis/AxisInfo.h	2026-09-30 01:32:39.242350505 +0800
++++ b/include/triton/Analysis/AxisInfo.h	2026-10-01 01:50:51.802579047 +0800
 @@ -181,7 +181,7 @@
        initialize(funcOp);
        funcOp.walk([&](CallOpInterface callOp) {
@@ -11,8 +11,8 @@ diff -ruN a/include/triton/Analysis/AxisInfo.h b/include/triton/Analysis/AxisInf
        });
      }
 diff -ruN a/include/triton/Analysis/Utility.h b/include/triton/Analysis/Utility.h
---- a/include/triton/Analysis/Utility.h	2026-09-30 01:18:25.363355922 +0800
-+++ b/include/triton/Analysis/Utility.h	2026-09-28 02:41:25.274847215 +0800
+--- a/include/triton/Analysis/Utility.h	2026-09-30 01:32:39.242350505 +0800
++++ b/include/triton/Analysis/Utility.h	2026-10-01 01:50:51.802891867 +0800
 @@ -303,7 +303,7 @@
      moduleOp.walk([&](Operation *op) {
        auto caller = op->getParentOfType<FunctionOpInterface>();
@@ -23,8 +23,8 @@ diff -ruN a/include/triton/Analysis/Utility.h b/include/triton/Analysis/Utility.
          if (funcOp) {
            graph[caller].emplace_back(
 diff -ruN a/include/triton/Dialect/Triton/IR/Dialect.h b/include/triton/Dialect/Triton/IR/Dialect.h
---- a/include/triton/Dialect/Triton/IR/Dialect.h	2026-09-30 01:18:25.365420140 +0800
-+++ b/include/triton/Dialect/Triton/IR/Dialect.h	2026-09-28 02:36:55.535423019 +0800
+--- a/include/triton/Dialect/Triton/IR/Dialect.h	2026-09-30 01:32:39.244350532 +0800
++++ b/include/triton/Dialect/Triton/IR/Dialect.h	2026-10-01 01:50:51.803156706 +0800
 @@ -24,7 +24,7 @@
  namespace triton {
  
@@ -35,8 +35,8 @@ diff -ruN a/include/triton/Dialect/Triton/IR/Dialect.h b/include/triton/Dialect/
  
  class DialectInferLayoutInterface
 diff -ruN a/include/triton/Dialect/Triton/IR/TritonDialect.td b/include/triton/Dialect/Triton/IR/TritonDialect.td
---- a/include/triton/Dialect/Triton/IR/TritonDialect.td	2026-09-30 01:18:25.365420140 +0800
-+++ b/include/triton/Dialect/Triton/IR/TritonDialect.td	2026-09-28 02:35:02.041266606 +0800
+--- a/include/triton/Dialect/Triton/IR/TritonDialect.td	2026-09-30 01:32:39.244350532 +0800
++++ b/include/triton/Dialect/Triton/IR/TritonDialect.td	2026-10-01 01:50:51.803360533 +0800
 @@ -37,7 +37,6 @@
  
    let hasConstantMaterializer = 1;
@@ -46,9 +46,24 @@ diff -ruN a/include/triton/Dialect/Triton/IR/TritonDialect.td b/include/triton/D
  
  include "triton/Dialect/Triton/IR/TritonTypes.td"
 diff -ruN a/include/triton/Dialect/Triton/IR/TritonOps.td b/include/triton/Dialect/Triton/IR/TritonOps.td
---- a/include/triton/Dialect/Triton/IR/TritonOps.td	2026-09-30 01:18:25.365420140 +0800
-+++ b/include/triton/Dialect/Triton/IR/TritonOps.td	2026-09-29 22:33:53.778290011 +0800
-@@ -658,6 +658,23 @@
+--- a/include/triton/Dialect/Triton/IR/TritonOps.td	2026-09-30 01:32:39.244350532 +0800
++++ b/include/triton/Dialect/Triton/IR/TritonOps.td	2026-10-01 01:51:06.766710855 +0800
+@@ -141,6 +141,14 @@
+     let assemblyFormat = "$x `,` $min `,` $max `,` `propagateNan` `=` $propagateNan attr-dict `:` type($result)";
+ }
+ 
++// Elementwise reciprocal approximation. CodeGen emits chip.rcp.approx.f32.
++def TT_ChipRcpOp : TT_Op<"chip_rcp", [Pure, SameOperandsAndResultType]> {
++  let summary = "f32 reciprocal approximation for a new instruction";
++  let arguments = (ins RankedTensorOf<[F32]>:$src);
++  let results = (outs RankedTensorOf<[F32]>:$result);
++  let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
++}
++
+ //
+ // Math Ops
+ //
+@@ -658,6 +666,23 @@
      let hasVerifier = 1;
  }
  
@@ -72,7 +87,7 @@ diff -ruN a/include/triton/Dialect/Triton/IR/TritonOps.td b/include/triton/Diale
  //
  // Reduce Op
  //
-@@ -958,6 +975,13 @@
+@@ -958,6 +983,13 @@
        return getOperandsMutable();
      }
  
@@ -86,7 +101,7 @@ diff -ruN a/include/triton/Dialect/Triton/IR/TritonOps.td b/include/triton/Diale
    }];
  
    let assemblyFormat = [{
-@@ -1083,7 +1107,7 @@
+@@ -1083,7 +1115,7 @@
    let arguments = (ins Variadic<AnyType>:$srcs);
  
    let builders = [OpBuilder<(ins), [{
@@ -96,9 +111,9 @@ diff -ruN a/include/triton/Dialect/Triton/IR/TritonOps.td b/include/triton/Diale
  
    let assemblyFormat = "attr-dict ($srcs^ `:` type($srcs))?";
 diff -ruN a/include/triton/Dialect/Triton/Transforms/Passes.h b/include/triton/Dialect/Triton/Transforms/Passes.h
---- a/include/triton/Dialect/Triton/Transforms/Passes.h	2026-09-30 01:18:25.366318024 +0800
-+++ b/include/triton/Dialect/Triton/Transforms/Passes.h	2026-09-29 21:58:44.893581654 +0800
-@@ -10,9 +10,16 @@
+--- a/include/triton/Dialect/Triton/Transforms/Passes.h	2026-09-30 01:32:39.245350546 +0800
++++ b/include/triton/Dialect/Triton/Transforms/Passes.h	2026-10-01 01:51:06.617735239 +0800
+@@ -10,9 +10,17 @@
  
  std::unique_ptr<Pass> createReorderBroadcastPass();
  std::unique_ptr<Pass> createRewriteTensorPointerPass();
@@ -106,6 +121,7 @@ diff -ruN a/include/triton/Dialect/Triton/Transforms/Passes.h b/include/triton/D
 +std::unique_ptr<Pass> createFuseDotEpiloguePass();
 +std::unique_ptr<Pass> createLowerFusedDotMulPass();
 +std::unique_ptr<Pass> createTileDotPass(int32_t targetSm = 70);
++std::unique_ptr<Pass> createLowerChipRcpToLLVMPass();
  
  } // namespace triton
  
@@ -116,9 +132,9 @@ diff -ruN a/include/triton/Dialect/Triton/Transforms/Passes.h b/include/triton/D
  #include "triton/Dialect/Triton/Transforms/Passes.h.inc"
  
 diff -ruN a/include/triton/Dialect/Triton/Transforms/Passes.td b/include/triton/Dialect/Triton/Transforms/Passes.td
---- a/include/triton/Dialect/Triton/Transforms/Passes.td	2026-09-30 01:18:25.366318024 +0800
-+++ b/include/triton/Dialect/Triton/Transforms/Passes.td	2026-09-29 21:58:44.892628885 +0800
-@@ -28,6 +28,43 @@
+--- a/include/triton/Dialect/Triton/Transforms/Passes.td	2026-09-30 01:32:39.245350546 +0800
++++ b/include/triton/Dialect/Triton/Transforms/Passes.td	2026-10-01 01:51:08.438443326 +0800
+@@ -28,6 +28,58 @@
    let dependentDialects = ["mlir::triton::TritonDialect"];
  }
  
@@ -147,6 +163,21 @@ diff -ruN a/include/triton/Dialect/Triton/Transforms/Passes.td b/include/triton/
 +  let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
 +}
 +
++def TritonChipRcpToLLVM : Pass<"triton-chip-rcp-to-llvm", "mlir::ModuleOp"> {
++  let summary = "Lower tt.chip_rcp to llvm.inline_asm";
++  let description = [{
++    Replace each static-shape f32 tt.chip_rcp with per-element
++    llvm.inline_asm "chip.rcp.approx.f32". This is the CodeGen step a
++    vendor would put in ElementwiseOpToLLVM::createDestOps. It does not
++    assign layouts.
++  }];
++  let constructor = "mlir::triton::createLowerChipRcpToLLVMPass()";
++  let dependentDialects = [
++    "mlir::triton::TritonDialect", "mlir::arith::ArithDialect",
++    "mlir::tensor::TensorDialect", "mlir::LLVM::LLVMDialect"
++  ];
++}
++
 +def TritonTileDot : Pass<"triton-tile-dot", "mlir::ModuleOp"> {
 +  let summary = "Tile the K dimension of tt.dot with a fixed strategy";
 +  let constructor = "mlir::triton::createTileDotPass()";
@@ -163,8 +194,8 @@ diff -ruN a/include/triton/Dialect/Triton/Transforms/Passes.td b/include/triton/
    let summary = "Rewrite load/stores with tensor pointers into legacy load/stores";
    let description = [{
 diff -ruN a/include/triton/Dialect/TritonGPU/IR/Dialect.h b/include/triton/Dialect/TritonGPU/IR/Dialect.h
---- a/include/triton/Dialect/TritonGPU/IR/Dialect.h	2026-09-30 01:18:25.366602191 +0800
-+++ b/include/triton/Dialect/TritonGPU/IR/Dialect.h	2026-09-28 02:36:55.899424017 +0800
+--- a/include/triton/Dialect/TritonGPU/IR/Dialect.h	2026-09-30 01:32:39.245350546 +0800
++++ b/include/triton/Dialect/TritonGPU/IR/Dialect.h	2026-10-01 01:50:51.804463231 +0800
 @@ -20,7 +20,7 @@
  namespace gpu {
  
@@ -175,8 +206,8 @@ diff -ruN a/include/triton/Dialect/TritonGPU/IR/Dialect.h b/include/triton/Diale
  
  unsigned getTotalElemsPerThread(Type type);
 diff -ruN a/include/triton/Dialect/TritonGPU/IR/TritonGPUDialect.td b/include/triton/Dialect/TritonGPU/IR/TritonGPUDialect.td
---- a/include/triton/Dialect/TritonGPU/IR/TritonGPUDialect.td	2026-09-30 01:18:25.366602191 +0800
-+++ b/include/triton/Dialect/TritonGPU/IR/TritonGPUDialect.td	2026-09-28 02:35:02.044266606 +0800
+--- a/include/triton/Dialect/TritonGPU/IR/TritonGPUDialect.td	2026-09-30 01:32:39.246350559 +0800
++++ b/include/triton/Dialect/TritonGPU/IR/TritonGPUDialect.td	2026-10-01 01:50:51.804670986 +0800
 @@ -48,7 +48,6 @@
  
    let useDefaultTypePrinterParser = 1;
@@ -186,8 +217,8 @@ diff -ruN a/include/triton/Dialect/TritonGPU/IR/TritonGPUDialect.td b/include/tr
  
  #endif
 diff -ruN a/include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td b/include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td
---- a/include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td	2026-09-30 01:18:25.366602191 +0800
-+++ b/include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td	2026-09-28 02:42:55.434565745 +0800
+--- a/include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td	2026-09-30 01:32:39.246350559 +0800
++++ b/include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td	2026-10-01 01:50:51.804899762 +0800
 @@ -104,7 +104,11 @@
    let builders = [
        OpBuilder<(ins "Value":$src, "Value":$result,
@@ -203,7 +234,7 @@ diff -ruN a/include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td b/include/triton
    let results = (outs TTG_AsyncToken:$token);
 diff -ruN a/lib/Analysis/ReshapeDecomposition.cpp b/lib/Analysis/ReshapeDecomposition.cpp
 --- a/lib/Analysis/ReshapeDecomposition.cpp	1970-01-01 08:00:00.000000000 +0800
-+++ b/lib/Analysis/ReshapeDecomposition.cpp	2026-09-29 21:08:16.614094189 +0800
++++ b/lib/Analysis/ReshapeDecomposition.cpp	2026-10-01 01:50:51.805137342 +0800
 @@ -0,0 +1,46 @@
 +#include "triton/Analysis/Utility.h"
 +
@@ -252,8 +283,8 @@ diff -ruN a/lib/Analysis/ReshapeDecomposition.cpp b/lib/Analysis/ReshapeDecompos
 +
 +} // namespace mlir
 diff -ruN a/lib/Analysis/Utility.cpp b/lib/Analysis/Utility.cpp
---- a/lib/Analysis/Utility.cpp	2026-09-30 01:18:25.369110557 +0800
-+++ b/lib/Analysis/Utility.cpp	2026-09-29 21:08:03.331164082 +0800
+--- a/lib/Analysis/Utility.cpp	2026-09-30 01:32:39.249350600 +0800
++++ b/lib/Analysis/Utility.cpp	2026-10-01 01:50:51.805332012 +0800
 @@ -319,44 +319,6 @@
    return elementSizeInBytes * getScratchSizeInElems();
  }
@@ -300,8 +331,8 @@ diff -ruN a/lib/Analysis/Utility.cpp b/lib/Analysis/Utility.cpp
    return cast<BlockedEncodingAttr>(srcEncoding);
  }
 diff -ruN a/lib/Dialect/Triton/IR/Ops.cpp b/lib/Dialect/Triton/IR/Ops.cpp
---- a/lib/Dialect/Triton/IR/Ops.cpp	2026-09-30 01:18:25.373416827 +0800
-+++ b/lib/Dialect/Triton/IR/Ops.cpp	2026-09-28 02:37:48.794599525 +0800
+--- a/lib/Dialect/Triton/IR/Ops.cpp	2026-09-30 01:32:39.254350667 +0800
++++ b/lib/Dialect/Triton/IR/Ops.cpp	2026-10-01 01:50:51.805677143 +0800
 @@ -15,7 +15,7 @@
  void LoadOp::getEffects(
      SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
@@ -387,7 +418,7 @@ diff -ruN a/lib/Dialect/Triton/IR/Ops.cpp b/lib/Dialect/Triton/IR/Ops.cpp
    assert(operands.size() == 1);
 diff -ruN a/lib/Dialect/Triton/Transforms/AnnotateDotStages.cpp b/lib/Dialect/Triton/Transforms/AnnotateDotStages.cpp
 --- a/lib/Dialect/Triton/Transforms/AnnotateDotStages.cpp	1970-01-01 08:00:00.000000000 +0800
-+++ b/lib/Dialect/Triton/Transforms/AnnotateDotStages.cpp	2026-09-29 21:08:03.331164082 +0800
++++ b/lib/Dialect/Triton/Transforms/AnnotateDotStages.cpp	2026-10-01 01:50:51.806036353 +0800
 @@ -0,0 +1,36 @@
 +#include "mlir/IR/BuiltinAttributes.h"
 +#include "mlir/IR/BuiltinOps.h"
@@ -426,29 +457,31 @@ diff -ruN a/lib/Dialect/Triton/Transforms/AnnotateDotStages.cpp b/lib/Dialect/Tr
 +}
 +} // namespace mlir::triton
 diff -ruN a/lib/Dialect/Triton/Transforms/CMakeLists.txt b/lib/Dialect/Triton/Transforms/CMakeLists.txt
---- a/lib/Dialect/Triton/Transforms/CMakeLists.txt	2026-09-30 01:18:25.373416827 +0800
-+++ b/lib/Dialect/Triton/Transforms/CMakeLists.txt	2026-09-30 00:30:32.286592711 +0800
-@@ -3,7 +3,9 @@
+--- a/lib/Dialect/Triton/Transforms/CMakeLists.txt	2026-09-30 01:32:39.254350667 +0800
++++ b/lib/Dialect/Triton/Transforms/CMakeLists.txt	2026-10-01 01:51:12.204872513 +0800
+@@ -3,7 +3,10 @@
  add_public_tablegen_target(TritonCombineIncGen)
  
  add_triton_library(TritonTransforms
 +  AnnotateDotStages.cpp
    Combine.cpp
 +  FuseAndTileDot.cpp
++  LowerChipRcpToLLVM.cpp
    ReorderBroadcast.cpp
    RewriteTensorPointer.cpp
  
-@@ -14,5 +16,7 @@
+@@ -14,5 +17,8 @@
    LINK_LIBS PUBLIC
    MLIRPass
    MLIRTransformUtils
 +  MLIRSCFDialect
 +  MLIRTensorDialect
++  MLIRLLVMDialect
    TritonIR
  )
 diff -ruN a/lib/Dialect/Triton/Transforms/FuseAndTileDot.cpp b/lib/Dialect/Triton/Transforms/FuseAndTileDot.cpp
 --- a/lib/Dialect/Triton/Transforms/FuseAndTileDot.cpp	1970-01-01 08:00:00.000000000 +0800
-+++ b/lib/Dialect/Triton/Transforms/FuseAndTileDot.cpp	2026-09-29 22:01:26.742075387 +0800
++++ b/lib/Dialect/Triton/Transforms/FuseAndTileDot.cpp	2026-10-01 01:50:51.806349344 +0800
 @@ -0,0 +1,172 @@
 +#include "mlir/Dialect/Arith/IR/Arith.h"
 +#include "mlir/Dialect/SCF/IR/SCF.h"
@@ -622,9 +655,96 @@ diff -ruN a/lib/Dialect/Triton/Transforms/FuseAndTileDot.cpp b/lib/Dialect/Trito
 +  return std::make_unique<TileDotPass>(options);
 +}
 +} // namespace mlir::triton
+diff -ruN a/lib/Dialect/Triton/Transforms/LowerChipRcpToLLVM.cpp b/lib/Dialect/Triton/Transforms/LowerChipRcpToLLVM.cpp
+--- a/lib/Dialect/Triton/Transforms/LowerChipRcpToLLVM.cpp	1970-01-01 08:00:00.000000000 +0800
++++ b/lib/Dialect/Triton/Transforms/LowerChipRcpToLLVM.cpp	2026-10-01 01:54:50.980437469 +0800
+@@ -0,0 +1,83 @@
++#include "mlir/Dialect/Arith/IR/Arith.h"
++#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
++#include "mlir/Dialect/Tensor/IR/Tensor.h"
++#include "mlir/IR/BuiltinOps.h"
++#include "mlir/Pass/Pass.h"
++#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
++#include "triton/Dialect/Triton/IR/Dialect.h"
++
++#define GEN_PASS_DECL_TRITONCHIPRCPTOLLVM
++#define GEN_PASS_DEF_TRITONCHIPRCPTOLLVM
++#include "triton/Dialect/Triton/Transforms/Passes.h.inc"
++
++using namespace mlir;
++using namespace mlir::triton;
++
++namespace {
++
++// Stand-in for ElementwiseOpToLLVM::createDestOps. The production pattern
++// emits this asm after layout conversion has already scalarized the value.
++// Here the input is still a static-shape f32 tensor, so each element is
++// extracted, lowered, and inserted.
++LogicalResult lowerChipRcp(ChipRcpOp op, PatternRewriter &rewriter) {
++  auto tensorTy = dyn_cast<RankedTensorType>(op.getSrc().getType());
++  if (!tensorTy || !tensorTy.hasStaticShape() || tensorTy.getRank() < 1)
++    return failure();
++  auto elemTy = dyn_cast<FloatType>(tensorTy.getElementType());
++  if (!elemTy || elemTy.getWidth() != 32)
++    return failure();
++
++  Location loc = op.getLoc();
++  ArrayRef<int64_t> shape = tensorTy.getShape();
++  Value dest = rewriter.create<tensor::EmptyOp>(loc, shape, elemTy);
++  int64_t n = tensorTy.getNumElements();
++  SmallVector<int64_t> coords(shape.size());
++  for (int64_t linear = 0; linear < n; ++linear) {
++    int64_t rem = linear;
++    for (int d = static_cast<int>(shape.size()) - 1; d >= 0; --d) {
++      coords[d] = rem % shape[d];
++      rem /= shape[d];
++    }
++    SmallVector<Value> indices;
++    indices.reserve(coords.size());
++    for (int64_t c : coords)
++      indices.push_back(rewriter.create<arith::ConstantIndexOp>(loc, c));
++    Value elem = rewriter.create<tensor::ExtractOp>(loc, op.getSrc(), indices);
++    auto asmOp = rewriter.create<LLVM::InlineAsmOp>(
++        loc, elemTy, ValueRange{elem},
++        /*asm_string=*/"chip.rcp.approx.f32 $0, $1",
++        /*constraints=*/"=f,f",
++        /*has_side_effects=*/false,
++        /*is_align_stack=*/false,
++        /*tail_call_kind=*/LLVM::tailcallkind::TailCallKind::None,
++        /*asm_dialect=*/
++        LLVM::AsmDialectAttr::get(rewriter.getContext(), LLVM::AsmDialect::AD_ATT),
++        /*operand_attrs=*/ArrayAttr());
++    Value lowered = asmOp.getRes();
++    dest = rewriter.create<tensor::InsertOp>(loc, lowered, dest, indices);
++  }
++  rewriter.replaceOp(op, dest);
++  return success();
++}
++
++class LowerChipRcpToLLVMPass
++    : public ::impl::TritonChipRcpToLLVMBase<LowerChipRcpToLLVMPass> {
++public:
++  void runOnOperation() override {
++    RewritePatternSet patterns(&getContext());
++    patterns.add(+[](ChipRcpOp op, PatternRewriter &rewriter) -> LogicalResult {
++      return lowerChipRcp(op, rewriter);
++    });
++    if (failed(applyPatternsGreedily(getOperation(),
++                                     FrozenRewritePatternSet(std::move(patterns)))))
++      signalPassFailure();
++  }
++};
++
++} // namespace
++
++namespace mlir::triton {
++std::unique_ptr<Pass> createLowerChipRcpToLLVMPass() {
++  return std::make_unique<LowerChipRcpToLLVMPass>();
++}
++} // namespace mlir::triton
 diff -ruN a/lib/Dialect/TritonGPU/IR/Dialect.cpp b/lib/Dialect/TritonGPU/IR/Dialect.cpp
---- a/lib/Dialect/TritonGPU/IR/Dialect.cpp	2026-09-30 01:18:25.374581555 +0800
-+++ b/lib/Dialect/TritonGPU/IR/Dialect.cpp	2026-09-28 02:41:06.546710770 +0800
+--- a/lib/Dialect/TritonGPU/IR/Dialect.cpp	2026-09-30 01:32:39.256350694 +0800
++++ b/lib/Dialect/TritonGPU/IR/Dialect.cpp	2026-10-01 01:50:51.806785820 +0800
 @@ -2875,7 +2875,7 @@
    effects.emplace_back(MemoryEffects::Allocate::get(),
                         mlir::triton::gpu::SharedMemory::get());
@@ -664,14 +784,82 @@ diff -ruN a/lib/Dialect/TritonGPU/IR/Dialect.cpp b/lib/Dialect/TritonGPU/IR/Dial
                         mlir::triton::gpu::SharedMemory::get());
  }
  
+diff -ruN a/python/src/ir.cc b/python/src/ir.cc
+--- a/python/src/ir.cc	2026-09-30 01:32:39.263350789 +0800
++++ b/python/src/ir.cc	2026-10-01 01:51:11.452598377 +0800
+@@ -1407,6 +1407,10 @@
+            [](TritonOpBuilder &self, Value &val) -> Value {
+              return self.create<math::ExpOp>(val);
+            })
++      .def("create_chip_rcp",
++           [](TritonOpBuilder &self, Value &val) -> Value {
++             return self.create<triton::ChipRcpOp>(val.getType(), val);
++           })
+       .def("create_exp2",
+            [](TritonOpBuilder &self, Value &val) -> Value {
+              return self.create<math::Exp2Op>(val);
 diff -ruN a/python/src/passes.cc b/python/src/passes.cc
---- a/python/src/passes.cc	2026-09-30 01:18:25.380081123 +0800
-+++ b/python/src/passes.cc	2026-09-29 21:08:03.331164082 +0800
-@@ -39,6 +39,7 @@
+--- a/python/src/passes.cc	2026-09-30 01:32:39.263350789 +0800
++++ b/python/src/passes.cc	2026-10-01 01:51:10.325129127 +0800
+@@ -39,6 +39,8 @@
    ADD_PASS_WRAPPER_0("add_reorder_broadcast", createReorderBroadcastPass);
    ADD_PASS_WRAPPER_0("add_rewrite_tensor_pointer",
                       createRewriteTensorPointerPass);
 +  ADD_PASS_WRAPPER_1("add_annotate_dot_stages", createAnnotateDotStagesPass, int);
++  ADD_PASS_WRAPPER_0("add_lower_chip_rcp", createLowerChipRcpToLLVMPass);
    ADD_PASS_WRAPPER_4("add_convert_to_ttgpuir",
                       createConvertTritonToTritonGPUPass, const std::string &,
                       int, int, int);
+diff -ruN a/python/triton/language/__init__.py b/python/triton/language/__init__.py
+--- a/python/triton/language/__init__.py	2026-09-30 01:32:39.271350897 +0800
++++ b/python/triton/language/__init__.py	2026-10-01 01:51:19.232919785 +0800
+@@ -104,7 +104,7 @@
+     where,
+ )
+ from .math import (umulhi, exp, exp2, fma, log, log2, cos, rsqrt, sin, sqrt, sqrt_rn, abs, fdiv, div_rn, erf, floor,
+-                   ceil)
++                   ceil, chip_rcp)
+ from .random import (
+     pair_uniform_to_normal,
+     philox,
+@@ -146,6 +146,7 @@
+     "cast",
+     "cdiv",
+     "ceil",
++    "chip_rcp",
+     "clamp",
+     "const",
+     "const_pointer_type",
+diff -ruN a/python/triton/language/math.py b/python/triton/language/math.py
+--- a/python/triton/language/math.py	2026-09-30 01:32:39.273852168 +0800
++++ b/python/triton/language/math.py	2026-10-01 01:51:15.505407693 +0800
+@@ -93,6 +93,16 @@
+ 
+ 
+ @core.builtin
++@_check_dtype(dtypes=["fp32"])
++@_add_math_1arg_docstr("reciprocal approximation")
++@core._tensor_member_fn
++def chip_rcp(x, _builder=None):
++    """Elementwise f32 reciprocal approximation. Lowers to chip.rcp.approx.f32."""
++    x = core._to_tensor(x, _builder)
++    return core.tensor(_builder.create_chip_rcp(x.handle), x.type)
++
++
++@core.builtin
+ @_check_dtype(dtypes=["fp32", "fp64"])
+ @_add_math_1arg_docstr("exponential")
+ @core._tensor_member_fn
+diff -ruN a/third_party/nvidia/backend/compiler.py b/third_party/nvidia/backend/compiler.py
+--- a/third_party/nvidia/backend/compiler.py	2026-09-30 01:32:39.314351477 +0800
++++ b/third_party/nvidia/backend/compiler.py	2026-10-01 01:51:15.846361292 +0800
+@@ -205,6 +205,9 @@
+         passes.convert.add_scf_to_cf(pm)
+         passes.convert.add_index_to_llvmir(pm)
+         passes.ttgpuir.add_allocate_shared_memory(pm)
++        # tt.chip_rcp -> llvm.inline_asm. The installed wheel does not
++        # contain this binding until Triton is rebuilt.
++        passes.ttir.add_lower_chip_rcp(pm)
+         nvidia.passes.ttgpuir.add_to_llvmir(pm, capability)
+         nvidia.passes.ttnvgpuir.add_nvgpu_to_llvm(pm)
+         passes.convert.add_arith_to_llvmir(pm)

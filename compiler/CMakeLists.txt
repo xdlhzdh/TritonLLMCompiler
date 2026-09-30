@@ -91,6 +91,7 @@ add_executable(tt-opt
   ${CMAKE_CURRENT_SOURCE_DIR}/tt-opt.cpp
   ${TRITON_SRC}/lib/Dialect/Triton/Transforms/AnnotateDotStages.cpp
   ${TRITON_SRC}/lib/Dialect/Triton/Transforms/FuseAndTileDot.cpp
+  ${TRITON_SRC}/lib/Dialect/Triton/Transforms/LowerChipRcpToLLVM.cpp
 )
 add_dependencies(tt-opt TritonTableGen TritonTransformsIncGen TritonGPUTableGen TritonGPUAttrDefsIncGen)
 set_target_properties(tt-opt PROPERTIES
