@@ -6,12 +6,12 @@ Triton 3.1 路线的 LLM 算子与编译器开发仓库。默认目标是 NVIDIA
 
 | 路径 | 命令 | 作用 |
 |---|---|---|
-| 已安装的 JIT | `.venv` 里的 `import triton` | `@triton.jit` 用来编译和启动 kernel |
-| Python pass 驱动 | `python -m triton_llm.tt_opt` | 用已安装的 `libtriton.so` 单步跑上游 pass，包括 `triton_gpu` |
-| 本仓库的 C++ opt | `./build/bin/tt-opt` | 跑手写的 TTIR pass。链接 LLVM 23，不能读 TTGIR |
-| Triton 源码 | submodule [`third_party/triton`](third_party/patches/README.md) | 不进本仓库的 git 历史。v3.1.0（`cf34004b`）。补丁在 [`third_party/patches/`](third_party/patches/README.md)，配置时打进 `build/triton-patched` |
+| 本仓库编译的 JIT | `scripts/build_libtriton.sh`，`.venv` 指向它 | `@triton.jit`：DSL 建 op、TTIR、TTGIR、LLVM、PTX、cubin |
+| Python pass 驱动 | `python -m triton_llm.tt_opt` | 用上一行那份 `libtriton.so` 单步跑上游 pass，包括 `triton_gpu` |
+| 同一次 cmake 的 opt | `./build/bin/triton-opt` | 和 `libtriton.so` 同一份 LLVM 19、同一套 pass，读 `.mlir` 做 FileCheck |
+| Triton 源码 | submodule [`third_party/triton`](third_party/patches/README.md) | 不进本仓库的 git 历史。v3.1.0（`cf34004b`）。补丁在 [`third_party/patches/`](third_party/patches/README.md)，由 `scripts/build_libtriton.sh` 打进 `build/triton-src` |
 
-这四条互不调用。改一个文件之后哪条路径会重新编译，见 [`docs/triton_mlir_path.md`](docs/triton_mlir_path.md) 第 6 节。
+`@triton.jit` 和 `python -m triton_llm.tt_opt` 调用同一份 `libtriton.so`。`build/bin/triton-opt` 是同一次 cmake 编出的命令行。改一个文件之后哪条路径会重新编译，见 [`docs/triton_mlir_path.md`](docs/triton_mlir_path.md) 第 5 节。
 
 ## 从这里开始
 
@@ -26,15 +26,9 @@ ctest --test-dir build --output-on-failure
 
 `scripts/build_all.sh` 依次做 cmake（带 `-DTRITON_LLM_ENABLE_SM90=ON`）、编译、ctest，再跑一次 pytest。
 
-`setup_venv.sh` 创建 `.venv`（已有则复用），用 PyTorch cu124 索引安装 [`requirements.txt`](requirements.txt)（Torch 2.5.1、Triton 3.1.0），然后 `pip install --no-deps -e .`。装好后可以直接 `import triton_llm`。在仓库根目录跑 `pytest` 时，[`pyproject.toml`](pyproject.toml) 会把 `python/` 加入模块搜索路径。ctest 里的 `triton_ops_pytest` 自己设置 `PYTHONPATH`。
+`setup_venv.sh` 往 `.venv` 里装两个包。第一步调用 `scripts/build_libtriton.sh`：打 `0001-frontend-llvm19.patch` 和 `0002-ttir-passes-llvm19.patch`，用 Triton 固定的 LLVM 19 编出 `libtriton.so`，用 `pip install -e build/triton-src/python` 把编译器 `triton` 装进 `.py-triton`，把 `triton-opt` 复制到 `build/bin/triton-opt`，再让 `.venv` 指向 `.py-triton`。第二步用 `pip install --no-deps -e .` 把本仓库的 `triton_llm`（`python/triton_llm`）装进同一个 `.venv`。两个包的区别见 [`docs/triton_mlir_path.md`](docs/triton_mlir_path.md) 第 1 节。
 
-只编手写 pass：
-
-```bash
-cmake --build build --target tt-opt -j"$(nproc)"
-```
-
-`python -m triton_llm.tt_opt` 和算子数值测试不需要这次 cmake。没有 `build/bin/tt-opt` 时，`test_python_cpp_handoff.py` 和 `test_tile_table_sync.py` 会 skip；`./tests/shell/run_tt_opt_tests.sh` 会失败。
+没有 `build/bin/triton-opt` 时，`test_python_cpp_handoff.py` 和 `test_tile_table_sync.py` 会 skip；`./tests/shell/run_tt_opt_tests.sh` 会失败。先跑 `scripts/build_libtriton.sh`。
 
 ## 环境
 
@@ -43,8 +37,8 @@ cmake --build build --target tt-opt -j"$(nproc)"
 | GPU | Tesla V100，compute capability 7.0 |
 | CUDA | 12.x。CUDA 13 去掉 sm_70 |
 | Python | 3.10+ |
-| MLIR / LLVM | `/opt/torch-mlir/externals/llvm-project/build`（LLVM 23）。CMake 找 `lib/cmake/mlir` |
-| FileCheck | 同一前缀下的 `bin/FileCheck`。`FILECHECK=` 可覆盖 |
+| LLVM | Triton 3.1.0 在 `cmake/llvm-hash.txt` 里固定的 `10dc3a8e`（LLVM 19）。`scripts/build_libtriton.sh` 用这份 LLVM 编 `libtriton.so` 和 `build/bin/triton-opt` |
+| FileCheck | `/opt/torch-mlir/externals/llvm-project/build/bin/FileCheck`。只比对文本，不参与编译。`FILECHECK=` 可覆盖 |
 
 确认解释器和 GPU：
 
@@ -59,7 +53,6 @@ cmake --build build --target tt-opt -j"$(nproc)"
 | `TRITON_LLM_ENABLE_SM90` | `ON` | 额外编 `triton_llm_cutlass_sm90`，`CUDA_ARCHITECTURES` 为 `90a` |
 | `TRITON_LLM_BUILD_TESTS` | `ON` | 注册 ctest |
 | `TRITON_LLM_ENABLE_TRITON_TESTS` | `ON` | 把 `pytest tests/python` 注册为 `triton_ops_pytest` |
-| `MLIR_DIR` | 上面 LLVM 23 的 `lib/cmake/mlir` | `find_package(MLIR)` |
 
 configure 且 `TRITON_LLM_ENABLE_CUDA=ON` 时，[`cmake/FindOrFetchCutlass.cmake`](cmake/FindOrFetchCutlass.cmake) 把 CUTLASS v3.5.1 头文件拉进构建树，不放进 `third_party/`。
 
@@ -102,39 +95,36 @@ python -m triton_llm.tt_opt --sm 70 --num-warps 4 --num-stages 2 --num-ctas 1 \
   artifacts/triton_ir/swiglu/_swiglu_kernel.ttir --make-ttgir
 ```
 
-默认 `--sm 70`、`--num-warps 4`、`--num-stages 3`、`--num-ctas 1`。`--list` 打印全部 flag。这个驱动没有 `--triton-fuse-dot-epilogue`、`--triton-tile-dot`、`--triton-annotate-dot-stages`。
+默认 `--sm 70`、`--num-warps 4`、`--num-stages 3`、`--num-ctas 1`。`--list` 打印全部 flag，包括下面四个手写 pass。
 
-## 手写 pass：`./build/bin/tt-opt`
+## 手写 pass：`./build/bin/triton-opt`
 
-入口是 [`compiler/tt-opt.cpp`](compiler/tt-opt.cpp)。`MlirOptMain` 读取命令行上的 `.mlir`。pass 的 flag 在补丁改过的 `Passes.td` 里，配置之后位于 `build/triton-patched/include/triton/Dialect/Triton/Transforms/Passes.td`。`--triton-annotate-dot-stages=sm=90` 里的 `sm=90` 在 pass 创建之后生效。
-
-它能解析的方言是 `tt`、`arith`、`func`、`math`、`scf`、`cf`、`tensor`、`llvm`。`llvm` 用来读前端 `for` 循环里的 `llvm.mlir.undef`。静态库 `TritonIR` 带了部分 `triton_gpu` 实现，否则 `Traits.cpp` 链接不过；解析器没有注册 `triton_gpu`，所以不能读 TTGIR。这个二进制和 `libtriton.so` 只通过 IR 文本交换数据，两边用的 LLVM 版本不同。
+入口是上游 `bin/triton-opt.cpp`。`0002` 把四个 pass 写进 `Passes.td`，`RegisterTritonDialects.h` 注册方言之后调用 `MlirOptMain`。`scripts/build_libtriton.sh` 把编出的二进制复制到 `build/bin/triton-opt`。它和 `libtriton.so` 是同一份 C++、同一份 LLVM 19。
 
 ```bash
-./build/bin/tt-opt --help
-./build/bin/tt-opt tests/tt/annotate_dot_stages.mlir --triton-annotate-dot-stages
-./build/bin/tt-opt tests/tt/annotate_dot_stages_sm90.mlir --triton-annotate-dot-stages="sm=90"
-./build/bin/tt-opt tests/tt/fuse_dot_epilogue.mlir --triton-fuse-dot-epilogue
-./build/bin/tt-opt tests/tt/fuse_then_tile.mlir \
+./build/bin/triton-opt --help
+./build/bin/triton-opt tests/tt/annotate_dot_stages.mlir --triton-annotate-dot-stages
+./build/bin/triton-opt tests/tt/annotate_dot_stages_sm90.mlir --triton-annotate-dot-stages="sm=90"
+./build/bin/triton-opt tests/tt/fuse_dot_epilogue.mlir --triton-fuse-dot-epilogue
+./build/bin/triton-opt tests/tt/fuse_then_tile.mlir \
   --triton-fuse-dot-epilogue --triton-lower-fused-dot-mul --triton-tile-dot
-./build/bin/tt-opt tests/tt/tile_dot.mlir --triton-tile-dot
-./build/bin/tt-opt tests/tt/tile_dot_sm90.mlir --triton-tile-dot="sm=90"
-./build/bin/tt-opt tests/tt/fused_dot_mul_verify.mlir -split-input-file -verify-diagnostics
-./build/bin/tt-opt tests/tt/fuse_dot_epilogue.mlir --triton-fuse-dot-epilogue --mlir-print-ir-after-all
+./build/bin/triton-opt tests/tt/tile_dot.mlir --triton-tile-dot
+./build/bin/triton-opt tests/tt/tile_dot_sm90.mlir --triton-tile-dot="sm=90"
+./build/bin/triton-opt tests/tt/fused_dot_mul_verify.mlir -split-input-file -verify-diagnostics
+./build/bin/triton-opt tests/tt/fuse_dot_epilogue.mlir --triton-fuse-dot-epilogue --mlir-print-ir-after-all
 ```
 
 | Flag | 源码 | 作用 |
 |---|---|---|
-| `--canonicalize` | 上游 MLIR | 与下面五个一起注册 |
+| `--canonicalize` | 上游 MLIR | 与下面四个一起注册 |
 | `--triton-annotate-dot-stages` | `AnnotateDotStages.cpp` | 每个 `tt.dot` 写 `triton_llm.num_stages`：`sm<80` 为 2，否则 3 |
 | `--triton-fuse-dot-epilogue` | `FuseAndTileDot.cpp` | 单次使用的 `tt.dot` 与同类型 `arith.mulf` 收成 `tt.fused_dot_mul` |
 | `--triton-lower-fused-dot-mul` | 同上 | 展开回 `tt.dot` 和循环外的 `arith.mulf` |
-| `--triton-tile-dot` | 同上 | 静态二维 `tt.dot` 在 K 能被 `BLOCK_K` 整除时改写成 `scf.for` + `tensor.extract_slice`。`triton_llm.block_k` 和 `triton_llm.num_stages` 写在 `scf.for` 上 |
-| `--triton-chip-rcp-to-llvm` | `LowerChipRcpToLLVM.cpp` | 静态形状的 f32 `tt.chip_rcp` 降成逐元素 `llvm.inline_asm`，指令文本是 `chip.rcp.approx.f32` |
+| `--triton-tile-dot` | 同上 | 静态二维 `tt.dot` 在 K 能被 `BLOCK_K` 整除时改写成 `scf.for` + `tensor.extract_slice`。`triton_llm.block_k` 和 `triton_llm.num_stages` 写在 `scf.for` 上。这份 IR 停在 TTIR |
 
-`tt.fused_dot_mul` 由补丁加进 `TritonOps.td`，`c`、`scale`、`d` 的类型必须相同（`AllTypesMatch`）。切分用固定表，不用 `@triton.autotune`。已安装的 JIT 不会跑这些 pass。补丁里的 `passes.cc` 写了 `add_annotate_dot_stages` 和 `add_lower_chip_rcp`，要重编 Triton 并装回 `.venv` 之后才会出现在 `libtriton.so` 里。融合和切分还没有对应的 `add_*`。`tl.chip_rcp` 从 AST 到 LLVM IR 的步骤见 [`docs/triton_mlir_path.md`](docs/triton_mlir_path.md) 第 4.5 节。
+四个手写 TTIR pass 在 `libtriton.so` 和 `build/bin/triton-opt` 里都能用同名 flag 调用。`CUDABackend.make_ttir` 不跑它们。lesson kernel 用 `choose_gemm_tile` 的 `BLOCK_*`，由这份 `.so` 经 TTGIR 到 `mma.sync.aligned.m8n8k4`，见 [`docs/triton_mlir_path.md`](docs/triton_mlir_path.md) 第 3.3 节。`tl.chip_rcp` 见第 3.5 节。假的自有 GPU backend 在 `python/triton_llm/backend/fakegpu/`，见第 4 节。
 
-[`tests/shell/run_tt_opt_tests.sh`](tests/shell/run_tt_opt_tests.sh) 执行 `tests/tt/*.mlir` 里的 `// RUN:`。它先把单词 `tt-opt` 换成 `python -m triton_llm.tt_opt`，再把 `TT_OPT_CPP` 换成 `build/bin/tt-opt`。手写 pass 的测试要写 `TT_OPT_CPP`。新增 pass 的步骤见 [`docs/triton_mlir_path.md`](docs/triton_mlir_path.md) 第 5.1 节。
+[`tests/shell/run_tt_opt_tests.sh`](tests/shell/run_tt_opt_tests.sh) 执行 `tests/tt/*.mlir` 里的 `// RUN:`。它先把单词 `tt-opt` 换成 `python -m triton_llm.tt_opt`，再把 `TT_OPT_CPP` 换成 `build/bin/triton-opt`。手写 pass 的测试要写 `TT_OPT_CPP`。新增 pass 怎样同时进 `.so` 和 `triton-opt`，见 [`docs/triton_mlir_path.md`](docs/triton_mlir_path.md) 第 4 节。
 
 ## IR 样例
 
@@ -158,7 +148,7 @@ python -m triton_llm.tt_opt artifacts/triton_ir/swiglu/_swiglu_kernel.ttir \
 MLIR_ENABLE_DUMP=1 TRITON_ALWAYS_COMPILE=1 python scripts/dump_triton_ir.py
 ```
 
-缓存目录默认 `~/.triton/cache`，用 `TRITON_CACHE_DIR` 改。
+缓存目录用 `TRITON_CACHE_DIR` 指定。
 
 ## CUTLASS 运行时
 
@@ -195,11 +185,11 @@ ctest 名称：`tt_opt_ir_tests`、`triton_ops_pytest`、`cutlass_swiglu_correct
 |---|---|---|
 | 四个算子的数值 | `tests/python/test_flash_attention.py`、`test_paged_attention.py`、`test_rmsnorm_rope.py`、`test_swiglu.py` | atol 1e-3、rtol 1e-2 |
 | tile 合法性 | `tests/python/test_tiling_config.py` | sm70 为 2 stage |
-| C++ 与 Python 的 tile 表 | `tests/python/test_tile_table_sync.py` | sm 70、75、80、86、90 一致。没有 `tt-opt` 则 skip |
+| C++ 与 Python 的 tile 表 | `tests/python/test_tile_table_sync.py` | sm 70、75、80、86、90 一致。没有 `triton-opt` 则 skip |
 | 前端 op、blocked、MMA v1、`dot_op` | `tests/python/test_frontend_middle.py` | 需要 GPU |
-| 前端 TTIR 交给 `tt-opt` | `tests/python/test_python_cpp_handoff.py` | 需要 GPU 和 `tt-opt` |
+| 前端 TTIR 交给 `triton-opt` | `tests/python/test_python_cpp_handoff.py` | 需要 GPU 和 `triton-opt` |
 | JIT 打出 ttir/ttgir/llir/ptx | `tests/python/test_triton_ir_dump.py` | 需要 GPU |
-| FileCheck 与 verifier 负例 | `tests/tt/*.mlir`，经 `run_tt_opt_tests.sh` | 需要 `tt-opt` 和 FileCheck |
+| FileCheck 与 verifier 负例 | `tests/tt/*.mlir`，经 `run_tt_opt_tests.sh` | 需要 `triton-opt` 和 FileCheck |
 | CUTLASS 数值 | 上面三个 `cutlass_*` ctest | sm90 在 cc&lt;90 时 SKIP |
 | ncu | `scripts/profile_ncu.sh` | 只检查 `ncu` 是否在 PATH，不采集指标 |
 
@@ -209,9 +199,8 @@ ctest 名称：`tt_opt_ir_tests`、`triton_ops_pytest`、`cutlass_swiglu_correct
 
 | 路径 | 内容 |
 |---|---|
-| [`CMakeLists.txt`](CMakeLists.txt) | 选项、`common`、`compiler`、`mlir/runtime`、两个 ctest |
-| [`compiler/tt-opt.cpp`](compiler/tt-opt.cpp) | `DialectRegistry`、`registerPass`、`MlirOptMain` |
-| [`compiler/CMakeLists.txt`](compiler/CMakeLists.txt) | `TritonIR` 与 `tt-opt` 的源文件和链接 |
+| [`CMakeLists.txt`](CMakeLists.txt) | 选项、`common`、`mlir/runtime`、两个 ctest |
+| [`scripts/build_libtriton.sh`](scripts/build_libtriton.sh) | 打 `0001`、`0002`，编 `libtriton.so` 和 `build/bin/triton-opt` |
 | [`common/cuda_utils.cuh`](common/cuda_utils.cuh) | CUDA 错误检查 |
 | [`python/triton_llm/ops/`](python/triton_llm/ops/) | 四个 `@triton.jit` kernel |
 | [`python/triton_llm/reference/`](python/triton_llm/reference/) | 数值参考 |
@@ -229,11 +218,11 @@ ctest 名称：`tt_opt_ir_tests`、`triton_ops_pytest`、`cutlass_swiglu_correct
 | [`third_party/patches/`](third_party/patches/README.md) | 为什么用 submodule 和补丁，哪些源码参与编译，哪些只供阅读 |
 | [`docs/`](docs/) | 见下表 |
 
-不提交到 git：`.venv/`、`build/`（含 `bin/tt-opt`、`mlir/runtime/` 下的测试程序，以及 cmake 下载的 CUTLASS）、`artifacts/`。
+不提交到 git：`.venv/`、`build/`（含 `bin/triton-opt`、`triton-src/`、`mlir/runtime/` 下的测试程序，以及 cmake 下载的 CUTLASS）、`artifacts/`。
 
 | 文档 | 内容 |
 |---|---|
-| [`docs/triton_mlir_path.md`](docs/triton_mlir_path.md) | 前中端流水线、Python 与 C++ 的交接、常见报错 |
+| [`docs/triton_mlir_path.md`](docs/triton_mlir_path.md) | `libtriton.so` 的编译、加载、流水线和命令 |
 | [`docs/architecture.md`](docs/architecture.md) | 两个 pass 驱动和 CUTLASS 各做什么 |
 | [`docs/environment.md`](docs/environment.md) | 本机路径 |
 | [`docs/acceptance.md`](docs/acceptance.md) | 验收门槛 |

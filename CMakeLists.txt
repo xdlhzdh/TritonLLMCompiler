@@ -39,8 +39,6 @@ endif()
 add_library(triton_llm_common INTERFACE)
 target_include_directories(triton_llm_common INTERFACE ${CMAKE_SOURCE_DIR}/common)
 
-add_subdirectory(compiler)
-
 if(TRITON_LLM_ENABLE_CUDA)
   include(${CMAKE_SOURCE_DIR}/cmake/FindOrFetchCutlass.cmake)
   add_subdirectory(mlir/runtime)

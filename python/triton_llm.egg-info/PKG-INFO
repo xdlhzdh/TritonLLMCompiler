@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: triton-llm
+Version: 0.2.0
+Summary: Triton LLM kernels, Triton-MLIR (tt) passes and a CUTLASS runtime for Volta
+Requires-Python: >=3.10
+Requires-Dist: torch==2.5.1
+Requires-Dist: triton==3.1.0
+Requires-Dist: numpy
+Requires-Dist: pytest>=7.0

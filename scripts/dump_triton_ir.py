@@ -2,7 +2,7 @@
 """Launch each Triton op once and write TTIR / TTGIR / LLVM IR / PTX.
 
 Usage:
-  PYTHONPATH=python python scripts/dump_triton_ir.py
+  python scripts/dump_triton_ir.py
   # files land in artifacts/triton_ir/<op>/
 """
 from __future__ import annotations

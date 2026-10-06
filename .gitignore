@@ -1,5 +1,6 @@
 build/
 .venv
+.py-triton/
 __pycache__/
 *.pyc
 .pytest_cache/

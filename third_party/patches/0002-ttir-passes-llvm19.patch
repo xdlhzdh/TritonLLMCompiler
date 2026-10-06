@@ -1,0 +1,406 @@
+diff -ruN a/bin/RegisterTritonDialects.h b/bin/RegisterTritonDialects.h
+--- a/bin/RegisterTritonDialects.h	2026-10-06 20:50:15.981798259 +0800
++++ b/bin/RegisterTritonDialects.h	2026-10-06 20:50:35.532829087 +0800
+@@ -20,6 +20,7 @@
+ #include "triton/Target/LLVMIR/Passes.h"
+ 
+ #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
++#include "mlir/Dialect/Tensor/IR/Tensor.h"
+ #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
+ #include "mlir/InitAllPasses.h"
+ 
+@@ -64,6 +65,7 @@
+                   mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect,
+                   mlir::triton::gpu::TritonGPUDialect, mlir::math::MathDialect,
+                   mlir::arith::ArithDialect, mlir::scf::SCFDialect,
++                  mlir::tensor::TensorDialect,
+                   mlir::gpu::GPUDialect, mlir::LLVM::LLVMDialect,
+                   mlir::NVVM::NVVMDialect, mlir::triton::nvgpu::NVGPUDialect,
+                   mlir::ROCDL::ROCDLDialect>();
+diff -ruN a/include/triton/Dialect/Triton/IR/TritonOps.td b/include/triton/Dialect/Triton/IR/TritonOps.td
+--- a/include/triton/Dialect/Triton/IR/TritonOps.td	2026-10-06 20:50:15.953767559 +0800
++++ b/include/triton/Dialect/Triton/IR/TritonOps.td	2026-10-06 20:50:26.146534027 +0800
+@@ -658,6 +658,23 @@
+     let hasVerifier = 1;
+ }
+ 
++// Dot plus a multiplicative epilogue. The scale is applied once, outside any
++// K loop introduced by triton-tile-dot.
++def TT_FusedDotMulOp : TT_Op<"fused_dot_mul", [Pure, AllTypesMatch<["c", "scale", "d"]>]> {
++  let summary = "dot with a multiply epilogue";
++  let arguments = (ins
++    TT_TensorOrMemDesc:$a,
++    TT_TensorOrMemDesc:$b,
++    TT_FpIntTensor:$c,
++    TT_FpIntTensor:$scale
++  );
++  let results = (outs TT_FpIntTensor:$d);
++  let assemblyFormat = [{
++    $a `,` $b `,` $c `,` $scale attr-dict `:`
++    type($a) `*` type($b) `,` type($c) `,` type($scale) `->` type($d)
++  }];
++}
++
+ //
+ // Reduce Op
+ //
+diff -ruN a/include/triton/Dialect/Triton/Transforms/Passes.h b/include/triton/Dialect/Triton/Transforms/Passes.h
+--- a/include/triton/Dialect/Triton/Transforms/Passes.h	2026-10-06 20:50:15.958372321 +0800
++++ b/include/triton/Dialect/Triton/Transforms/Passes.h	2026-10-06 20:55:39.952576792 +0800
+@@ -10,6 +10,13 @@
+ 
+ std::unique_ptr<Pass> createReorderBroadcastPass();
+ std::unique_ptr<Pass> createRewriteTensorPointerPass();
++std::unique_ptr<Pass> createAnnotateDotStagesPass(int32_t targetSm = 70);
++std::unique_ptr<Pass> createFuseDotEpiloguePass();
++std::unique_ptr<Pass> createLowerFusedDotMulPass();
++std::unique_ptr<Pass> createTileDotPass(int32_t targetSm = 70);
++
++#define GEN_PASS_DECL
++#include "triton/Dialect/Triton/Transforms/Passes.h.inc"
+ 
+ } // namespace triton
+ 
+diff -ruN a/include/triton/Dialect/Triton/Transforms/Passes.td b/include/triton/Dialect/Triton/Transforms/Passes.td
+--- a/include/triton/Dialect/Triton/Transforms/Passes.td	2026-10-06 20:50:15.962723322 +0800
++++ b/include/triton/Dialect/Triton/Transforms/Passes.td	2026-10-06 20:55:39.950321233 +0800
+@@ -28,6 +28,43 @@
+   let dependentDialects = ["mlir::triton::TritonDialect"];
+ }
+ 
++def TritonAnnotateDotStages : Pass<"triton-annotate-dot-stages", "mlir::ModuleOp"> {
++  let summary = "Stamp triton_llm.num_stages on tt.dot";
++  let description = [{
++    Walk tt.dot and set triton_llm.num_stages. sm < 80 gets 2 stages;
++    sm >= 80 gets 3.
++  }];
++  let constructor = "mlir::triton::createAnnotateDotStagesPass()";
++  let options = [
++    Option<"targetSm", "sm", "int32_t", "70", "compute capability">
++  ];
++  let dependentDialects = ["mlir::triton::TritonDialect"];
++}
++
++def TritonFuseDotEpilogue : Pass<"triton-fuse-dot-epilogue", "mlir::ModuleOp"> {
++  let summary = "Fold arith.mulf of a tt.dot into tt.fused_dot_mul";
++  let constructor = "mlir::triton::createFuseDotEpiloguePass()";
++  let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
++}
++
++def TritonLowerFusedDotMul : Pass<"triton-lower-fused-dot-mul", "mlir::ModuleOp"> {
++  let summary = "Lower tt.fused_dot_mul to tt.dot and arith.mulf";
++  let constructor = "mlir::triton::createLowerFusedDotMulPass()";
++  let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
++}
++
++def TritonTileDot : Pass<"triton-tile-dot", "mlir::ModuleOp"> {
++  let summary = "Tile the K dimension of tt.dot with a fixed strategy";
++  let constructor = "mlir::triton::createTileDotPass()";
++  let options = [
++    Option<"targetSm", "sm", "int32_t", "70", "compute capability">
++  ];
++  let dependentDialects = [
++    "mlir::triton::TritonDialect", "mlir::arith::ArithDialect",
++    "mlir::scf::SCFDialect", "mlir::tensor::TensorDialect"
++  ];
++}
++
+ def TritonRewriteTensorPointer : Pass</*cli-arg*/"triton-rewrite-tensor-pointer", /*Op*/"mlir::ModuleOp"> {
+   let summary = "Rewrite load/stores with tensor pointers into legacy load/stores";
+   let description = [{
+diff -ruN a/lib/Dialect/Triton/Transforms/AnnotateDotStages.cpp b/lib/Dialect/Triton/Transforms/AnnotateDotStages.cpp
+--- a/lib/Dialect/Triton/Transforms/AnnotateDotStages.cpp	1970-01-01 08:00:00.000000000 +0800
++++ b/lib/Dialect/Triton/Transforms/AnnotateDotStages.cpp	2026-10-06 20:55:39.957011780 +0800
+@@ -0,0 +1,36 @@
++#include "mlir/IR/BuiltinAttributes.h"
++#include "mlir/IR/BuiltinOps.h"
++#include "mlir/Pass/Pass.h"
++#include "triton/Dialect/Triton/IR/Dialect.h"
++#include "triton/Dialect/Triton/Transforms/Passes.h"
++
++namespace mlir {
++namespace triton {
++
++#define GEN_PASS_DEF_TRITONANNOTATEDOTSTAGES
++#include "triton/Dialect/Triton/Transforms/Passes.h.inc"
++
++class AnnotateDotStagesPass
++    : public impl::TritonAnnotateDotStagesBase<AnnotateDotStagesPass> {
++public:
++  using impl::TritonAnnotateDotStagesBase<
++      AnnotateDotStagesPass>::TritonAnnotateDotStagesBase;
++  friend std::unique_ptr<Pass> createAnnotateDotStagesPass(int32_t targetSm);
++
++  void runOnOperation() override {
++    int64_t stages = targetSm >= 80 ? 3 : 2;
++    OpBuilder builder(&getContext());
++    IntegerAttr attr = builder.getI64IntegerAttr(stages);
++    getOperation().walk(
++        [&](DotOp dot) { dot->setAttr("triton_llm.num_stages", attr); });
++  }
++};
++
++std::unique_ptr<Pass> createAnnotateDotStagesPass(int32_t targetSm) {
++  auto pass = std::make_unique<AnnotateDotStagesPass>();
++  pass->targetSm = targetSm;
++  return pass;
++}
++
++} // namespace triton
++} // namespace mlir
+diff -ruN a/lib/Dialect/Triton/Transforms/CMakeLists.txt b/lib/Dialect/Triton/Transforms/CMakeLists.txt
+--- a/lib/Dialect/Triton/Transforms/CMakeLists.txt	2026-10-06 20:50:15.967452564 +0800
++++ b/lib/Dialect/Triton/Transforms/CMakeLists.txt	2026-10-06 20:50:32.952748009 +0800
+@@ -3,7 +3,9 @@
+ add_public_tablegen_target(TritonCombineIncGen)
+ 
+ add_triton_library(TritonTransforms
++  AnnotateDotStages.cpp
+   Combine.cpp
++  FuseAndTileDot.cpp
+   ReorderBroadcast.cpp
+   RewriteTensorPointer.cpp
+ 
+@@ -14,5 +16,8 @@
+   LINK_LIBS PUBLIC
+   MLIRPass
+   MLIRTransformUtils
++  MLIRArithDialect
++  MLIRSCFDialect
++  MLIRTensorDialect
+   TritonIR
+ )
+diff -ruN a/lib/Dialect/Triton/Transforms/FuseAndTileDot.cpp b/lib/Dialect/Triton/Transforms/FuseAndTileDot.cpp
+--- a/lib/Dialect/Triton/Transforms/FuseAndTileDot.cpp	1970-01-01 08:00:00.000000000 +0800
++++ b/lib/Dialect/Triton/Transforms/FuseAndTileDot.cpp	2026-10-06 20:55:39.959223263 +0800
+@@ -0,0 +1,196 @@
++#include "mlir/Dialect/Arith/IR/Arith.h"
++#include "mlir/Dialect/SCF/IR/SCF.h"
++#include "mlir/Dialect/Tensor/IR/Tensor.h"
++#include "mlir/IR/BuiltinOps.h"
++#include "mlir/Pass/Pass.h"
++#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
++#include "triton/Dialect/Triton/IR/Dialect.h"
++#include "triton/Dialect/Triton/Transforms/Passes.h"
++
++namespace mlir {
++namespace triton {
++
++#define GEN_PASS_DEF_TRITONFUSEDOTEPILOGUE
++#define GEN_PASS_DEF_TRITONLOWERFUSEDDOTMUL
++#define GEN_PASS_DEF_TRITONTILEDOT
++#include "triton/Dialect/Triton/Transforms/Passes.h.inc"
++
++// Same candidate list as python/triton_llm/arch/tiling.py. The last candidate
++// that fits shared memory and the stage cap is the strategy.
++struct GemmTile {
++  int64_t blockK;
++  int64_t stages;
++};
++
++GemmTile gemmTileForSm(int32_t sm) {
++  int64_t limit = sm >= 90 ? 228 * 1024 : sm >= 80 ? 164 * 1024 : 96 * 1024;
++  int stagesCap = sm >= 80 ? 3 : 2;
++  struct Cand {
++    int bm, bn, bk, stages;
++  };
++  static constexpr Cand kCands[] = {
++      {64, 64, 32, 2}, {64, 128, 32, 2}, {128, 128, 32, 2},
++      {128, 128, 64, 2}, {128, 128, 64, 3},
++  };
++  GemmTile chosen{32, 2};
++  for (Cand c : kCands) {
++    if (c.stages > stagesCap)
++      continue;
++    int64_t bytes = int64_t(c.stages) * (c.bm * c.bk + c.bn * c.bk) * 2;
++    if (bytes <= limit)
++      chosen = GemmTile{c.bk, c.stages};
++  }
++  return chosen;
++}
++
++struct FuseDotEpiloguePattern : OpRewritePattern<arith::MulFOp> {
++  using OpRewritePattern::OpRewritePattern;
++
++  LogicalResult matchAndRewrite(arith::MulFOp mul,
++                                PatternRewriter &rewriter) const override {
++    Value lhs = mul.getLhs();
++    Value rhs = mul.getRhs();
++    auto dot = lhs.getDefiningOp<DotOp>();
++    Value scale = rhs;
++    if (!dot) {
++      dot = rhs.getDefiningOp<DotOp>();
++      scale = lhs;
++    }
++    if (!dot || !dot.getResult().hasOneUse())
++      return failure();
++    if (scale.getType() != dot.getResult().getType())
++      return failure();
++    auto fused = rewriter.create<FusedDotMulOp>(
++        mul.getLoc(), dot.getResult().getType(), dot.getA(), dot.getB(),
++        dot.getC(), scale);
++    rewriter.replaceOp(mul, fused.getResult());
++    rewriter.eraseOp(dot);
++    return success();
++  }
++};
++
++class FuseDotEpiloguePass
++    : public impl::TritonFuseDotEpilogueBase<FuseDotEpiloguePass> {
++public:
++  using impl::TritonFuseDotEpilogueBase<FuseDotEpiloguePass>::TritonFuseDotEpilogueBase;
++  friend std::unique_ptr<Pass> createFuseDotEpiloguePass();
++
++  void runOnOperation() override {
++    RewritePatternSet patterns(&getContext());
++    patterns.add<FuseDotEpiloguePattern>(&getContext());
++    if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(patterns))))
++      signalPassFailure();
++  }
++};
++
++struct LowerFusedDotMulPattern : OpRewritePattern<FusedDotMulOp> {
++  using OpRewritePattern::OpRewritePattern;
++
++  LogicalResult matchAndRewrite(FusedDotMulOp op,
++                                PatternRewriter &rewriter) const override {
++    auto dot = rewriter.create<DotOp>(op.getLoc(), op.getA(), op.getB(),
++                                      op.getC(), InputPrecision::IEEE, 0);
++    auto mul = rewriter.create<arith::MulFOp>(op.getLoc(), dot.getResult(),
++                                              op.getScale());
++    rewriter.replaceOp(op, mul.getResult());
++    return success();
++  }
++};
++
++class LowerFusedDotMulPass
++    : public impl::TritonLowerFusedDotMulBase<LowerFusedDotMulPass> {
++public:
++  using impl::TritonLowerFusedDotMulBase<
++      LowerFusedDotMulPass>::TritonLowerFusedDotMulBase;
++  friend std::unique_ptr<Pass> createLowerFusedDotMulPass();
++
++  void runOnOperation() override {
++    RewritePatternSet patterns(&getContext());
++    patterns.add<LowerFusedDotMulPattern>(&getContext());
++    if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(patterns))))
++      signalPassFailure();
++  }
++};
++
++class TileDotPass : public impl::TritonTileDotBase<TileDotPass> {
++public:
++  using impl::TritonTileDotBase<TileDotPass>::TritonTileDotBase;
++  friend std::unique_ptr<Pass> createTileDotPass(int32_t targetSm);
++
++  void runOnOperation() override {
++    GemmTile tile = gemmTileForSm(targetSm);
++    SmallVector<DotOp> dots;
++    getOperation().walk([&](DotOp dot) { dots.push_back(dot); });
++    for (DotOp dot : dots) {
++      if (failed(tileDot(dot, tile)))
++        continue;
++    }
++  }
++
++  LogicalResult tileDot(DotOp dot, GemmTile tile) {
++    auto aTy = dyn_cast<RankedTensorType>(dot.getA().getType());
++    auto bTy = dyn_cast<RankedTensorType>(dot.getB().getType());
++    auto cTy = dyn_cast<RankedTensorType>(dot.getC().getType());
++    if (!aTy || !bTy || !cTy || aTy.getRank() != 2 || bTy.getRank() != 2)
++      return failure();
++    if (!aTy.hasStaticShape() || !bTy.hasStaticShape())
++      return failure();
++    int64_t m = aTy.getDimSize(0);
++    int64_t k = aTy.getDimSize(1);
++    int64_t kB = bTy.getDimSize(0);
++    int64_t n = bTy.getDimSize(1);
++    if (k != kB || k <= tile.blockK || k % tile.blockK != 0)
++      return failure();
++    if (cTy.getRank() != 2 || cTy.getDimSize(0) != m || cTy.getDimSize(1) != n)
++      return failure();
++
++    OpBuilder builder(dot);
++    Location loc = dot.getLoc();
++    Value lb = builder.create<arith::ConstantIndexOp>(loc, 0);
++    Value ub = builder.create<arith::ConstantIndexOp>(loc, k);
++    Value step = builder.create<arith::ConstantIndexOp>(loc, tile.blockK);
++    auto aTileTy = RankedTensorType::get({m, tile.blockK}, aTy.getElementType());
++    auto bTileTy = RankedTensorType::get({tile.blockK, n}, bTy.getElementType());
++    auto forOp = builder.create<scf::ForOp>(
++        loc, lb, ub, step, ValueRange{dot.getC()},
++        [&](OpBuilder &b, Location bodyLoc, Value iv, ValueRange iterArgs) {
++          SmallVector<OpFoldResult> strides{b.getIndexAttr(1), b.getIndexAttr(1)};
++          Value aTile = b.create<tensor::ExtractSliceOp>(
++              bodyLoc, aTileTy, dot.getA(),
++              SmallVector<OpFoldResult>{b.getIndexAttr(0), iv},
++              SmallVector<OpFoldResult>{b.getIndexAttr(m),
++                                        b.getIndexAttr(tile.blockK)},
++              strides);
++          Value bTile = b.create<tensor::ExtractSliceOp>(
++              bodyLoc, bTileTy, dot.getB(),
++              SmallVector<OpFoldResult>{iv, b.getIndexAttr(0)},
++              SmallVector<OpFoldResult>{b.getIndexAttr(tile.blockK),
++                                        b.getIndexAttr(n)},
++              strides);
++          Value acc = b.create<DotOp>(bodyLoc, aTile, bTile, iterArgs[0],
++                                      InputPrecision::IEEE, 0)
++                          .getResult();
++          b.create<scf::YieldOp>(bodyLoc, acc);
++        });
++    forOp->setAttr("triton_llm.block_k", builder.getI64IntegerAttr(tile.blockK));
++    forOp->setAttr("triton_llm.num_stages", builder.getI64IntegerAttr(tile.stages));
++    dot.replaceAllUsesWith(forOp.getResult(0));
++    dot.erase();
++    return success();
++  }
++};
++
++std::unique_ptr<Pass> createFuseDotEpiloguePass() {
++  return std::make_unique<FuseDotEpiloguePass>();
++}
++std::unique_ptr<Pass> createLowerFusedDotMulPass() {
++  return std::make_unique<LowerFusedDotMulPass>();
++}
++std::unique_ptr<Pass> createTileDotPass(int32_t targetSm) {
++  auto pass = std::make_unique<TileDotPass>();
++  pass->targetSm = targetSm;
++  return pass;
++}
++
++} // namespace triton
++} // namespace mlir
+diff -ruN a/python/src/ir.cc b/python/src/ir.cc
+--- a/python/src/ir.cc	2026-10-06 20:50:15.976888539 +0800
++++ b/python/src/ir.cc	2026-10-06 20:50:35.521828741 +0800
+@@ -6,6 +6,7 @@
+ #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
+ #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+ #include "mlir/Dialect/Index/IR/IndexDialect.h"
++#include "mlir/Dialect/Tensor/IR/Tensor.h"
+ #include "mlir/Dialect/Index/IR/IndexOps.h"
+ #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+ #include "mlir/IR/Builders.h"
+@@ -207,7 +208,7 @@
+     DialectRegistry registry;
+     registry.insert<TritonDialect, ::mlir::triton::gpu::TritonGPUDialect,
+                     math::MathDialect, arith::ArithDialect, index::IndexDialect,
+-                    scf::SCFDialect, ::mlir::gpu::GPUDialect,
++                    scf::SCFDialect, tensor::TensorDialect, ::mlir::gpu::GPUDialect,
+                     cf::ControlFlowDialect, LLVM::LLVMDialect>();
+     registerBuiltinDialectTranslation(registry);
+     registerLLVMDialectTranslation(registry);
+diff -ruN a/python/src/passes.cc b/python/src/passes.cc
+--- a/python/src/passes.cc	2026-10-06 20:50:15.972480066 +0800
++++ b/python/src/passes.cc	2026-10-06 20:55:39.954698250 +0800
+@@ -39,6 +39,10 @@
+   ADD_PASS_WRAPPER_0("add_reorder_broadcast", createReorderBroadcastPass);
+   ADD_PASS_WRAPPER_0("add_rewrite_tensor_pointer",
+                      createRewriteTensorPointerPass);
++  ADD_PASS_WRAPPER_1("add_annotate_dot_stages", createAnnotateDotStagesPass, int);
++  ADD_PASS_WRAPPER_0("add_fuse_dot_epilogue", createFuseDotEpiloguePass);
++  ADD_PASS_WRAPPER_0("add_lower_fused_dot_mul", createLowerFusedDotMulPass);
++  ADD_PASS_WRAPPER_1("add_tile_dot", createTileDotPass, int);
+   ADD_PASS_WRAPPER_4("add_convert_to_ttgpuir",
+                      createConvertTritonToTritonGPUPass, const std::string &,
+                      int, int, int);

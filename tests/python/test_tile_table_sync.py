@@ -13,14 +13,14 @@ import pytest
 from triton_llm.arch.tiling import choose_gemm_tile
 
 ROOT = Path(__file__).resolve().parents[2]
-TT_OPT = ROOT / "build" / "bin" / "tt-opt"
+TT_OPT = ROOT / "build" / "bin" / "triton-opt"
 SRC = ROOT / "tests" / "tt" / "tile_dot.mlir"
 
 
 @pytest.mark.parametrize("sm", [70, 75, 80, 86, 90])
 def test_cpp_tile_matches_python_table(sm):
     if not TT_OPT.exists():
-        pytest.skip("build/bin/tt-opt is missing; run cmake --build build --target tt-opt")
+        pytest.skip("build/bin/triton-opt is missing; run scripts/build_libtriton.sh")
     proc = subprocess.run(
         [str(TT_OPT), str(SRC), f"--triton-tile-dot=sm={sm}"],
         capture_output=True, text=True, check=False,

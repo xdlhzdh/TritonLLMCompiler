@@ -24,6 +24,20 @@ _OPTION_FLAGS = {
 _META_FLAGS = {"--list"}
 
 
+def _flag_name(token: str) -> str:
+    return token.split("=", 1)[0]
+
+
+def _sm_override(token: str) -> int | None:
+    if "=" not in token:
+        return None
+    payload = token.split("=", 1)[1]
+    for part in payload.split(","):
+        if part.startswith("sm="):
+            return int(part.split("=", 1)[1])
+    return None
+
+
 def _pass_flags(argv: list[str]) -> list[str]:
     flags = []
     i = 0
@@ -32,7 +46,8 @@ def _pass_flags(argv: list[str]) -> list[str]:
         if token in _OPTION_FLAGS:
             i += 1 + _OPTION_FLAGS[token]
             continue
-        if token in _META_FLAGS or token.startswith("--") and token in BY_FLAG or token in {
+        name = _flag_name(token)
+        if token in _META_FLAGS or name in BY_FLAG or name in {
             "--make-ttir",
             "--make-ttgir",
         }:
@@ -56,15 +71,18 @@ def _load(path: Path):
 
 def run_file(path: Path, flags: list[str], options: PassOptions) -> str:
     module, context = _load(path)
-    for flag in expand_flags(flags, options.sm):
+    for raw in expand_flags(flags, options.sm):
+        flag = _flag_name(raw)
         step = BY_FLAG.get(flag)
         if step is None:
             known = ", ".join(sorted(BY_FLAG))
-            raise SystemExit(f"unknown pass {flag}. known: {known}, --make-ttir, --make-ttgir")
+            raise SystemExit(f"unknown pass {raw}. known: {known}, --make-ttir, --make-ttgir")
+        sm = _sm_override(raw)
+        opts = options if sm is None else PassOptions(sm, options.num_warps, options.num_stages, options.num_ctas)
         try:
-            step.run(module, context, options)
+            step.run(module, context, opts)
         except Exception as exc:
-            raise SystemExit(f"{flag} failed: {exc}") from exc
+            raise SystemExit(f"{raw} failed: {exc}") from exc
     return module.str()
 
 
@@ -79,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--list", action="store_true", help="print pass flags and the make-ttir/make-ttgir order")
     args, unknown = parser.parse_known_args(argv)
     if unknown:
-        bad = [token for token in unknown if token.startswith("-") and token not in BY_FLAG and token not in {
+        bad = [token for token in unknown if token.startswith("-") and _flag_name(token) not in BY_FLAG and _flag_name(token) not in {
             "--make-ttir",
             "--make-ttgir",
         }]

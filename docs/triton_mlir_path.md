@@ -2,305 +2,394 @@
 
 TTIR 是 `tt` 方言，TTGIR 是 `triton_gpu` 方言。本仓库走 Triton 自己的 MLIR，不经过 StableHLO、XLA 或 Linalg。
 
-## 1. `@triton.jit` 编译 kernel 时调用 `libtriton.so`
+源码是 submodule `third_party/triton`（v3.1.0，`cf34004b`）。本地改动是两份补丁，由 [`scripts/build_libtriton.sh`](../scripts/build_libtriton.sh) 打到 `build/triton-src`，再用 Triton 固定的 LLVM 19 编译。清单见 [`third_party/patches/README.md`](../third_party/patches/README.md)。
 
-用户在 Python 里调用一个 `@triton.jit` 函数。第一次调用时，当前这个 Python 进程加载 `.venv` 里的 `triton/_C/libtriton.so`，把函数编译成 cubin，再通过 CUDA driver API 启动。执行这次编译的是这个 `.so`，不是 `triton-opt` 这个可执行文件。
+| 节 | 内容 |
+|---|---|
+| 1 | `triton` 和 `triton_llm` 两个包的区别和安装；`libtriton.so` 怎么编出来 |
+| 2 | 这个 `.so` 何时加载，`@triton.jit` 的哪几行调用它 |
+| 3 | 从 Python 函数到 cubin：建 op、TTIR pass、tile、`tl.chip_rcp` |
+| 4 | `triton-opt` 与 `libtriton.so` 共用同一份 C++，以及换成自己的 GPU backend |
+| 5 | 按这个顺序运行 |
+| 6 | 主要入口函数 |
 
-调用链：
+## 1. 两个 Python 包：`triton` 和 `triton_llm`
 
-```text
-kernel[grid](...)
-  JITFunction.run                         runtime/jit.py
-    内存里已有这份编译结果 → 直接启动
-    否则 JITFunction.compile
-      triton.compiler.compile             compiler/compiler.py
-        from triton._C.libtriton import ir
-        backend.add_stages                nvidia/backend/compiler.py
-        ir.context() / ir.load_dialects   → libtriton.so
-        src.make_ir                       → ast_to_ttir → builder.create_*
-        按 stage 调用 make_ttir、make_ttgir、make_llir、make_ptx、make_cubin
-          每个 stage：pass_manager + passes.*.add_* + pm.run
-        写出 ~/.triton/cache
-      kernel.run                          launcher 调 CUDA driver API。launcher 是 gcc 或 clang 编译出来的 C 扩展
+`.venv` 里有两个包，各有一条 `pip install -e`。两条都由 [`scripts/setup_venv.sh`](../scripts/setup_venv.sh) 按顺序执行：
+
+```bash
+git submodule update --init third_party/triton
+scripts/setup_venv.sh
+source .venv/bin/activate
 ```
 
-`import triton` 加载的文件是安装目录里的 `triton/_C/libtriton.so`。它是 pybind11 模块，Python 里的名字是 `triton._C.libtriton`。`python/src/main.cc` 的 `PYBIND11_MODULE(libtriton, m)` 注册五个子模块：
-
-| 子模块 | 源码 | Python 用它做什么 |
+| | `triton` | `triton_llm` |
 |---|---|---|
-| `ir` | `python/src/ir.cc` | 建 `context`、`builder`、`module`、`pass_manager`；`parse_mlir_module` 读文本 |
-| `passes` | `python/src/passes.cc` | `add_combine` 这类函数，往 pass manager 里追加一个 C++ pass |
-| `llvm` | `python/src/llvm.cc` | 把 MLIR 的 LLVM dialect 转成 LLVM IR，再转成 PTX 文本 |
-| `nvidia` | `third_party/nvidia/triton_nvidia.cc` | 注册 NVIDIA 方言，以及 TTGIR 上的 NVIDIA pass |
-| `interpreter` | `python/src/interpreter.cc` | 只在 `TRITON_INTERPRET=1` 时处理 host 上的原子操作，不跑 MLIR pass |
+| 是什么 | Triton 编译器：DSL（`triton.language`）、编译流水线（`triton.compiler`）、运行时（`triton.runtime`）、C++ 扩展 `triton._C.libtriton` | 本仓库的代码：kernel、`tt_opt` 驱动、`fakegpu` backend |
+| 源码目录 | `build/triton-src/python`，即 submodule `third_party/triton` 打过补丁后的副本 | 本仓库的 `python/triton_llm` |
+| 安装命令 | `pip install -e build/triton-src/python --no-build-isolation --no-deps` | `pip install --no-deps -e .`（在仓库根目录） |
+| 谁执行 | [`scripts/build_libtriton.sh`](../scripts/build_libtriton.sh)，由 `setup_venv.sh` 第一步调用 | `setup_venv.sh` 第二步 |
+| 编译 | 跑 cmake 和 ninja，产物是 `libtriton.so` | 纯 Python |
 
-Python 和这份 `.so` 之间只有三种调用：
+依赖只有一个方向：`triton_llm` 的代码 `import triton`。改 Triton 的 C++ 之后重跑 `scripts/build_libtriton.sh`，它重新编 `libtriton.so` 并重新安装 `triton`。
 
-1. **建 op。** `tl.dot` 写在 `language/core.py`，检查在 `semantic.py`，最后是 `builder.create_dot(...)`。`create_dot` 是 `ir.cc` 里绑出来的 C++ 函数，返回的 `Value` 由 Python 拿着。
-2. **跑 pass。** `passes.ttir.add_combine(pm)` 只做一件事：`pm.addPass(createCombineOpsPass())`。接着 `pm.run(module)` 在 C++ 里跑完才返回。跑的过程中不再回到 Python。
-3. **交换文本。** `module.str()` 生成 IR 文本，`ir.parse_mlir_module` 再读回去。缓存里每个 stage 的文件就是这些文本。
+`triton_llm` 的 [`pyproject.toml`](../pyproject.toml) 把依赖写成 `triton==3.1.0`。安装 `triton_llm` 的那条命令因此必须带 `--no-deps`，否则 pip 会从 PyPI 下载官方 `triton` 包，替换刚编出来的这一份。
 
-`make_ttir` 这些函数本身是 Python（`nvidia/backend/compiler.py`）。它们决定 pass 的先后，真正改 IR 的是 `.so` 里的 C++。
+仓库根目录的 CMake 编 CUTLASS 运行时并注册 ctest，不编 `libtriton.so`。
 
-磁盘缓存的 key 含有 `libtriton.so` 的全部字节，以及已安装的 `compiler/`、`backends/`、`language/` 里的 Python 源码。换掉这个 `.so`，`~/.triton/cache` 里已有的编译结果全部失效。这个目录可以用 `TRITON_CACHE_DIR` 改到别处。`MLIR_ENABLE_DUMP=1` 会在每个 pass 前后打印 IR。同时还要设 `TRITON_ALWAYS_COMPILE=1`，否则命中缓存之后，这些 pass 不会再执行。
+### 1.1 `build_libtriton.sh`：编 `libtriton.so`，安装 `triton`
 
-`TRITON_INTERPRET=1` 时，`jit()` 返回 `InterpretedFunction`，不会进入上面的 `compile()`。解释器按调用时给出的 grid，在 Python 里用 numpy 做计算；原子操作调用 `libtriton.interpreter`。本仓库没有测这条路径。
+LLVM 用 [`third_party/triton/cmake/llvm-hash.txt`](../third_party/triton/cmake/llvm-hash.txt) 里的 `10dc3a8e`（LLVM 19）。脚本按以下顺序执行：
 
-## 2. `libtriton.so` 和 `triton-opt` 各做什么
+1. 把 submodule 复制到 `build/triton-src`（这份副本不进 git），先打 `0001-frontend-llvm19.patch`，再打 `0002-ttir-passes-llvm19.patch`。同时改这份副本的 `python/setup.py`：编译时不把警告当错误，不编 Triton 的单元测试，并且不编 proton。补丁内容一变，脚本就删掉 `build/triton-src`，重新复制。submodule 本身保持上游原样。
+2. 没有 `.py-triton` 时，用 Python 3.12 创建这个 venv，并写入 `torch-from-tritonqattn.pth`。这个文件把提供 PyTorch 的那个环境的 `site-packages` 加进模块搜索路径，torch、numpy、pytest 都从那里来。那个环境本身不被修改。
+3. 在 `.py-triton` 的 site-packages 里写入 `zz-prefer-built-triton.pth`，每次运行脚本都覆盖。文件名以 `zz-` 开头，Python 启动时会排在 pip 生成的 editable `.pth` 后面执行。它只有一行 `import`，把自编 `triton` 的 finder 移到 `sys.meta_path` 最前，因此 `import triton` 加载的是 `build/triton-src` 里的包。没有这个文件时，会加载到 PyTorch 那个环境里的官方 `triton`。
+4. 用 `.py-triton/bin/pip install -e build/triton-src/python --no-build-isolation --no-deps` 编译并安装 `triton`。这一条命令同时跑 cmake/ninja 和 editable 安装，细节在 1.2 节。
+5. 把同一次 cmake 编出的 `triton-opt` 复制到 `build/bin/triton-opt`。`triton-opt` 是命令行程序，不是 Python 模块。
+6. `ln -sfn .py-triton .venv`，并确认 `triton.language.chip_rcp` 存在。
 
-上游 Triton 的一次构建同时产出这两个文件。它们链接同一批 pass 的 `.cpp`，入口不同。本仓库没有做这次完整构建，见第 2.2 节。
+两份补丁：
 
-`@triton.jit` 编译并启动 kernel 时，Python 只调用 `libtriton.so`。`triton-opt` 是命令行程序：读一份 `.mlir`，执行 pass，把改过的 IR 写到标准输出。上游的 lit 用它做 FileCheck。它不生成 cubin，`@triton.jit` 也不会启动它。
-
-| | `libtriton.so` | `triton-opt` |
-|---|---|---|
-| 谁调用 | 调用了 `@triton.jit` 函数的那个 Python 进程 | 开发者在终端里执行，或 lit 测试脚本执行 |
-| 输入 | Python 函数 | 一份 `.mlir` 文件 |
-| 输出 | cubin，随后由 launcher 启动 kernel | 改过的 IR 文本，写到标准输出 |
-| 入口 | `python/src/main.cc` | `bin/triton-opt.cpp`，大约十行：注册方言，然后 `MlirOptMain` |
-
-`bin/triton-opt.cpp` 通过同目录的 `RegisterTritonDialects.h` 完成注册：Triton、TritonGPU、NVIDIA 的 pass，再加上 TTIR→TTGIR、TTGIR→LLVM。注册的方言包括 `tt`、`triton_gpu`、`triton_nvidia_gpu`、`nvgpu`、`arith`、`math`、`scf`、`cf`、`gpu`、`llvm`、`nvvm`、`rocdl`。同目录还有 `triton-llvm-opt`、`triton-lsp`、`triton-reduce`。这三个也是命令行程序，`@triton.jit` 不调用它们。
-
-`test/lit.cfg.py` 用这些二进制跑 `.mlir` / `.ll` 的 FileCheck。pip 装上的 wheel 不带 `triton-opt`，本机 `.venv/bin` 里也没有。
-
-### 2.1 工业界：同一次构建产出这两个文件
-
-工业界不是在「重编 `libtriton.so`」和「编译 `triton-opt` 专门测 pass」里选一条。一次 `cmake` 构建同时产出这两个文件。两个文件链接同一份 pass 的 `.cpp`，也链接同一份 LLVM。
-
-| 文件 | 谁用它 | 少了它会怎样 |
-|---|---|---|
-| `libtriton.so` | 用户调用 `@triton.jit` 的那个 Python 进程 | 用户启动的 kernel 里没有这个 pass。FileCheck 通过之后也仍然没有 |
-| `triton-opt` | 写 pass 的人，以及 lit。输入是一份 `.mlir`，输出是改过的 IR | 没有单独的 `.mlir` 测试。要看 pass 的效果，只能把 kernel 启动起来。它不生成 cubin |
-
-加一个 pass 时，上游仓库里改下面这些地方，然后重新构建，两个文件一起更新：
-
-1. `Passes.td` 和 pass 的 `.cpp`。
-2. 在 `bin/RegisterTritonDialects.h` 里注册，让 `triton-opt` 能通过该 pass 的 flag 运行它。`test/` 里加 lit，对 `.mlir` 做 FileCheck。
-3. `python/src/passes.cc` 增加 `add_*`。
-4. `make_ttir` 或 `make_ttgir` 调用这个 `add_*`。
-5. 把新的 `libtriton.so` 装进 Python 环境。此后 `@triton.jit` 编译 kernel 时会执行这个 pass。
-
-第 2 步只让命令行和 lit 能跑这个 pass。第 3 到第 5 步才让 `@triton.jit` 执行它。
-
-芯片厂商如果沿用 Triton 的 Python 前端，`@triton.jit` 的写法可以保留。要替换的是 backend：在 `BaseBackend.add_stages` 里换成自己的 pass 顺序，用 `DriverBase` 在自己的设备上启动 kernel。NVIDIA 在 `TritonToTritonGPUPass.cpp` 和 `TritonGPUToLLVM.cpp` 的前面和后面插入 pass。换成另一种 GPU 时，才需要自己的 GPU dialect，以及降到自己指令集的 lowering。
-
-### 2.2 本仓库停在测试这一半
-
-`build/bin/tt-opt` 对应上表里的 `triton-opt`，注册了五个手写 pass。其中四个改 TTIR。`triton-chip-rcp-to-llvm` 的整条路径见第 4.5 节。tile 用固定表。用户调用 `@triton.jit` 时，这些 pass 不会执行。
-
-| 工业界一次 Triton 构建 | 本仓库现在 |
+| 补丁 | 作用 |
 |---|---|
-| `triton-opt` 注册全部方言和 pass，能从 TTIR 走到 LLVM | `build/bin/tt-opt` 只注册这五个 pass。不能读 `triton_gpu`，不生成 PTX |
-| lit 调用上游的 `bin/triton-opt` | `tests/shell/run_tt_opt_tests.sh` 调用 `build/bin/tt-opt`。本仓库不编译 `bin/triton-opt.cpp`，也不运行 lit |
-| 同一份 `.cpp` 链进 `libtriton.so` | 这些 pass 只在 `build/bin/tt-opt` 里。`.venv` 里的 `libtriton.so` 是 pip 的 Triton 3.1.0，不含它们 |
-| `passes.cc` 的 `add_*` 被 `make_ttir` / `make_ttgir` / `make_llir` 调用，并且这份代码在已安装的 `.so` 里 | `passes.cc` 里有 `add_annotate_dot_stages` 和 `add_lower_chip_rcp`。融合和切分没有 `add_*`。补丁的 `make_llir` 调用了 `add_lower_chip_rcp`。已安装的 `compiler.py` 和 `.so` 都没有这次改动 |
-| `libtriton.so` 和 `triton-opt` 链接同一份 LLVM | `.venv` 的 `.so` 用 Triton 3.1.0 在 `cmake/llvm-hash.txt` 里固定的 LLVM。`tt-opt` 用 `/opt/torch-mlir` 的 LLVM 23。两边只能传递 IR 文本 |
+| `0001-frontend-llvm19.patch` | DSL 增加 `tl.chip_rcp`，经 TTGIR 降到 PTX `rcp.approx.ftz.f32`。见第 3.5 节 |
+| `0002-ttir-passes-llvm19.patch` | 增加 `tt.fused_dot_mul`，以及四条只在命令行 flag 上运行的 TTIR pass。flag 和变换见第 3.2 节 |
 
-因此，`@triton.jit` 编译出的 cubin 里没有这些 pass 改过的 IR。要让 `@triton.jit` 执行它们：把 pass 的 `.cpp` 编进 Triton，在 `passes.cc` 里补上融合和切分还没有的 `add_*`，在对应的 stage 里调用，再用这次构建产出的 `libtriton.so` 替换 `.venv` 里的那一份。`build/bin/tt-opt` 仍然可以对 `.mlir` 做 FileCheck。替换 `.so` 这一步不能省。`tl.chip_rcp` 还要额外经过第 4.5 节里的 TTIR→TTGIR。
+### 1.2 一条 `pip install -e` 同时完成编译和安装
 
-## 3. 本仓库里的三个程序
+```bash
+.py-triton/bin/pip install -e build/triton-src/python --no-build-isolation --no-deps
+```
 
-| 程序 | 是什么 | 会不会把 `@triton.jit` 函数编成 cubin |
+编译：pip 调用 `build/triton-src/python/setup.py` 的 `CMakeBuild.build_extension`，由它跑 cmake 和 ninja。cmake 的源码目录是 `build/triton-src`。`-DCMAKE_LIBRARY_OUTPUT_DIRECTORY` 指向包内的 `triton/_C/`，ninja 把 `.so` 写到 `build/triton-src/python/triton/_C/libtriton.so`。`build/triton-src/python/src/main.cc` 的 `PYBIND11_MODULE(libtriton, m)` 注册子模块 `ir`、`passes`、`llvm`、`interpreter` 和 `nvidia`。两份补丁里的 C++ 都链进这一个 `.so`。
+
+安装：`-e` 是 editable 安装，源码留在 `build/triton-src/python`。pip 在 `.py-triton` 的 site-packages 里放 finder `__editable___triton_3_1_0_finder`。`import triton` 经这个 finder 找到 `build/triton-src/python/triton/__init__.py`，再加载同目录的 `_C/libtriton.so`。进程里的 `triton._C.libtriton` 就是 ninja 写出的那个文件。
+
+两个参数：
+
+- `--no-build-isolation`：在 `.py-triton` 里构建，pip 不另建临时环境。cmake 的构建目录留在 `build/triton-src/python/build`，重跑时只编改过的文件。
+- `--no-deps`：不按 `setup.py` 的依赖列表再装包。torch 由 `torch-from-tritonqattn.pth` 指向的环境提供。这和安装 `triton_llm` 时的 `--no-deps` 是两回事，后者是为了避开 PyPI 上的 `triton==3.1.0`。
+
+提供 PyTorch 的环境里另有一份官方 `triton`。`torch-from-tritonqattn.pth` 把那个 `site-packages` 加进模块搜索路径之后，按普通路径查找会先找到这份官方包。`zz-prefer-built-triton.pth` 把自编 finder 提前，`import triton` 才会用 `build/triton-src` 里的包。
+
+### 1.3 确认两个包的来源
+
+```bash
+.venv/bin/python -c "import os, triton, triton_llm; print(triton.__file__); print(os.path.realpath(triton._C.libtriton.__file__)); print(triton_llm.__file__)"
+```
+
+前两行应在 `build/triton-src/python/triton/` 下，第三行应在本仓库的 `python/triton_llm/` 下。
+
+## 2. `@triton.jit` 对 `libtriton.so` 的调用
+
+`@triton.jit` 把函数包装成 `JITFunction`（`triton/runtime/jit.py`）。装饰器执行时不生成 IR。第一次 `kernel[grid](...)` 进入 `JITFunction.run`；`self.cache[device]` 里没有这份结果时，`run` 调用 `triton.compiler.compile`。
+
+这次编译分成前端、中端、后端。`CUDABackend`（`nvidia/backend/compiler.py`）是 NVIDIA 目标的插件，`add_stages` 登记从 `make_ttir` 到 `make_cubin` 的阶段：中端是 `make_ttir` 和 `make_ttgir`，后端是 `make_llir`、`make_ptx`、`make_cubin`。
+
+| 段 | 输入 → 输出 | 函数 |
 |---|---|---|
-| `.venv` 里的 Triton 3.1.0 | 安装包：Python 文件、`libtriton.so`、`ptxas` | 会。`@triton.jit` 编译 kernel 时用的就是这一份 |
-| `python -m triton_llm.tt_opt` | 本仓库的 Python 脚本。它调用上一行那个 `.so` 里已经有的 pass | 不会。输入是一份 `.mlir`，用来执行 `.so` 里已经有的 pass |
-| `build/bin/tt-opt` | 本仓库编译出的可执行文件。含手写的 TTIR pass，以及把 `tt.chip_rcp` 降成 `llvm.inline_asm` 的 pass | 不会。不能解析 TTGIR，也不生成 PTX |
+| 前端 | Python AST → TTIR | `ASTSource.make_ir`、`ast_to_ttir` |
+| 中端 | TTIR → 优化后的 TTIR → TTGIR | `CUDABackend.make_ttir`、`make_ttgir` |
+| 后端 | TTGIR → LLVM IR → PTX → cubin | `CUDABackend.make_llir`、`make_ptx`、`make_cubin` |
 
-Triton 源码是 submodule `third_party/triton`（v3.1.0，`cf34004`），不进本仓库的提交。本地改动在 `third_party/patches/`。CMake 把 submodule 复制到 `build/triton-patched`，打上补丁，再编 `tt-opt`。哪些目录参与这次编译、哪些只供阅读，见 [`third_party/patches/README.md`](../third_party/patches/README.md)。
+### 2.1 编译前的准备
 
-这三个程序不会互相调用。`build/bin/tt-opt` 链接 LLVM 23。`.venv` 里的 `libtriton.so` 链接的是 Triton 3.1.0 在 `cmake/llvm-hash.txt` 里固定的那一版 LLVM。这两个二进制不能传递 C++ 对象，只能传递 IR 文本。`tt.fused_dot_mul` 和 `tt.chip_rcp` 都是补丁增加的 op，已安装的 `libtriton.so` 解析不了它们。要把 `build/bin/tt-opt` 里融合之后的 IR 再交给 `python -m triton_llm.tt_opt`，先加上 `--triton-lower-fused-dot-mul`，把 `tt.fused_dot_mul` 展开回 `tt.dot`。`tt.chip_rcp` 要先用 `--triton-chip-rcp-to-llvm` 降掉。
+1. `JITFunction.run` 按实参的类型和 constexpr 值生成 cache key（不同的类型或 constexpr 各编一份 kernel），查 `self.cache[device]`。命中则直接 `kernel.run`。
+2. 未命中时，`make_backend(driver.active.get_current_target())` 得到 `CUDABackend`，`parse_options` 得到编译选项。然后构造 `signature`、`constants` 和 `ASTSource`。
+3. `compile()` 用同一个 `target` 再调用一次 `make_backend`，然后查磁盘缓存。命中则读回 `CompiledKernel`，不登记、不执行 stage。
+4. 磁盘缓存未命中时，`CUDABackend.add_stages` 把 `make_ttir`、`make_ttgir`、`make_llir`、`make_ptx`、`make_cubin` 放进 `stages`。这一步只登记，不执行。跑完后写入磁盘缓存，`run` 再把 `CompiledKernel` 放进 `self.cache[device]`。
 
-## 4. 从 Python 函数到 cubin
+### 2.2 前端：Python AST → TTIR
 
-### 4.1 第一份 TTIR
+`compile()` 调用 `ASTSource.make_ir`，再调用 `ast_to_ttir`。`CodeGenerator.visit` 遍历 Python AST，通过 `builder.create_*`（`.so` 中的 `ir.cc`）建 op。结果是还没有执行任何 pass 的 TTIR。见第 3.1 节。
 
-`compile()` 里 `src.make_ir` 调用 `ast_to_ttir`（`python/triton/compiler/code_generator.py`）。`CodeGenerator.visit` 遍历 AST，通过 `builder.create_*` 写下 `tt.func`、`tt.load`、`tt.dot`、`scf.for`。这时还没有跑 `make_ttir`。
+### 2.3 中端：TTIR 优化，降到 TTGIR
 
-[`lesson.py`](../python/triton_llm/compiler/lesson.py) 把下表这些写法放在同一个 kernel 里。[`frontend.py`](../python/triton_llm/compiler/frontend.py) 的 `capture_frontend_ttir(jit_fn, launch)` 在 `make_ttir` 之前取出模块。`CompiledKernel.asm["ttir"]` 是 `make_ttir` 跑完之后的文本。其中的 `triton-rewrite-tensor-pointer` 已经把 `tt.make_tensor_ptr` 改掉，所以这份文本里看不到它。
+`compile()` 按 `stages` 的顺序先执行这两段，每段都是 `passes.*.add_*` 加上 `pm.run`：
 
-| Python | 第一份 TTIR |
-|---|---|
-| `tl.program_id` | `tt.get_program_id` |
-| `tl.arange` | `tt.make_range` |
-| 指针加偏移 | `tt.addptr` |
-| `tl.load` / `tl.store` | `tt.load` / `tt.store` |
-| `for` | `scf.for`。归纳变量的占位是 `llvm.mlir.undef : i32` |
-| `if` | `scf.if` |
-| `tl.dot` | `tt.dot` |
-| `tl.sum` | `tt.reduce` |
-| 标量铺到 tile | `tt.splat` |
-| `tl.make_block_ptr` | `tt.make_tensor_ptr` |
-| `tl.constexpr` 的 `BLOCK_*` | 张量类型的形状，例如 `tensor<16x16xf16>`，不出现在 `tt.func` 的参数列表里 |
-| 16 字节对齐的指针 | 参数属性 `tt.divisibility = 16` |
-| `do_not_specialize=["M","N","K"]` | `M`、`N`、`K` 留在 `tt.func` 参数里 |
+- `make_ttir`：TTIR 上与目标无关的优化，例如 inline、`triton-combine`、CSE。见第 3.2 节。
+- `make_ttgir`：TTIR 转成 TTGIR，按 sm 给张量选 layout，把 `tt.dot` 标成 MMA layout。从这一段开始依赖目标。见第 3.3 节。
 
-`for` 的 IR 里有 `llvm.mlir.undef`，所以读取这份 IR 的工具必须能解析 `llvm` 方言。`build/bin/tt-opt` 因此注册了 `LLVMDialect`。
+### 2.4 后端：TTGIR → cubin
 
-[`tests/python/test_frontend_middle.py`](../tests/python/test_frontend_middle.py) 检查这张表。
+- `make_llir`：TTGIR 降到 LLVM dialect，再转成 LLVM IR 并做 O3。
+- `make_ptx`：LLVM 的 NVPTX 后端生成 PTX。
+- `make_cubin`：`ptxas` 把 PTX 汇编成 cubin。
 
-用已有 op 组成新函数时，写一个 `@triton.jit` 辅助函数即可，不用重新编译。`tt.fused_dot_mul` 由 pass 生成，前端没有对应的 `tl.*`。新增内建 `tl.chip_rcp` 的接法和后续转换见第 4.5 节。
+见第 3.4 节。
 
-### 4.2 `make_ttir`
+### 2.5 `libtriton.so` 何时加载
 
-顺序写在 submodule 的 `third_party/nvidia/backend/compiler.py`，函数是 `CUDABackend.make_ttir`。`python -m triton_llm.tt_opt --make-ttir` 跑的是同一串 pass，里面没有本仓库的手写 pass。跑完之后仍是 `tt` 方言，张量上还没有 layout。
+加载发生在 `import triton`，早于 `@triton.jit`。`triton/backends/__init__.py` 的 `_discover_backends()` 导入 `nvidia/backend/compiler.py`，该文件开头是：
+
+```python
+from triton._C.libtriton import ir, passes, llvm, nvidia
+```
+
+执行这一行时，动态链接器加载 `build/triton-src/python/triton/_C/libtriton.so`。前端、中端、后端调用的都是这个已经加载的模块。
+
+### 2.6 调用图
+
+```text
+import triton                                          加载 .so
+  _discover_backends()
+    import nvidia/backend/compiler.py
+      from triton._C.libtriton import ir, passes, llvm, nvidia
+        加载 build/triton-src/python/triton/_C/libtriton.so
+
+@triton.jit                                            构造 JITFunction
+kernel[grid](...)
+  JITFunction.run                                      triton/runtime/jit.py
+    按实参类型和 constexpr 生成 cache key
+    查 self.cache[device]                              进程内缓存
+    命中
+      kernel.run                                       CudaLauncher，CUDA driver API
+    未命中
+      make_backend → CUDABackend，parse_options        Python
+      构造 signature、constants、ASTSource             Python，这一步还没有 IR
+      triton.compiler.compile                          triton/compiler/compiler.py
+        make_backend → CUDABackend                     Python
+        查 TRITON_CACHE_DIR/<hash>/                    磁盘缓存，FileCacheManager
+        命中
+          读回 CompiledKernel，不执行 stages
+        未命中
+          CUDABackend.add_stages                       Python，登记五个 stage
+          ir.context()、ir.load_dialects               .so  ir.cc
+          CUDABackend.load_dialects                    .so  nvidia
+          前端
+            ASTSource.make_ir
+              ast_to_ttir                              triton/compiler/code_generator.py
+                builder.create_*                       .so  ir.cc
+          中端
+            make_ttir
+              passes.common / passes.ttir 的 add_*     .so  passes.cc
+              pm.run                                   .so  ir.cc
+            make_ttgir
+              passes.ttgpuir / nvidia.passes 的 add_*  .so  passes.cc、nvidia
+              pm.run                                   .so  ir.cc
+          后端
+            make_llir
+              nvidia.passes.ttgpuir.add_to_llvmir      .so  nvidia
+              llvm.to_module、llvm.optimize_module     .so  llvm.cc
+            make_ptx
+              llvm.translate_to_asm                    .so  llvm.cc
+            make_cubin
+              ptxas                                    不经过 libtriton.so
+          把各 stage 写入 TRITON_CACHE_DIR/<hash>/
+      self.cache[device][key] = kernel                 写入进程内缓存
+      kernel.run                                       CudaLauncher，CUDA driver API
+```
+
+`pm.run` 在 C++ 里跑完才回到 Python。`ptxas` 和 `CudaLauncher` 不进入 `libtriton.so`。
+
+调用图里有两次查找，这就是两层缓存。先查进程内，进程内没有再进 `compile()` 查磁盘。
+
+**进程内缓存**由 `JITFunction.run` 查。`JITFunction.__init__` 把 `self.cache` 设成 `defaultdict(dict)`：外层 key 是 device，内层 key 是实参类型和 constexpr 组成的签名。命中则直接 `kernel.run`，不调用 `compile()`。未命中时，`compile()` 返回之后，`run` 执行 `self.cache[device][key] = kernel`。这张表只在当前进程里。
+
+**磁盘缓存**由 `compile()` 查，在第二次 `make_backend` 之后、`add_stages` 之前。`get_cache_manager` 返回 `FileCacheManager`，目录是 `TRITON_CACHE_DIR/<hash>/`。`hash` 是这一串的 sha256：`triton_key()`、`src.hash()`、`backend.hash()`、`options.hash()`、`get_cache_invalidating_env_vars()`。`triton_key()` 覆盖 `libtriton.so` 的字节，以及 `compiler/`、`backends/`、`language/` 下的 Python 文件。目录里已有 `<kernel 名>.json` 时，`compile()` 用这些文件构造 `CompiledKernel` 并返回，不执行 `stages`。否则跑完 stage，把 `ttir`、`ttgir`、`llir`、`ptx`、`cubin` 和这份 json 写进同一目录。`TRITON_ALWAYS_COMPILE=1` 时跳过这次查找。
+
+Python 侧用到的接口就是图里标了 `.so` 的那些：
+
+| 调用 | 子模块 | 作用 |
+|---|---|---|
+| `ir.context`、`ir.load_dialects`、`builder.create_*`、`ir.pass_manager`、`pm.run`、`module.str`、`ir.parse_mlir_module` | `ir` | 建 context、建 op、跑 pass、把模块换成文本或读回来 |
+| `passes.ttir.add_*`、`passes.ttgpuir.add_*`、`passes.common.add_*` | `passes` | 往 pass manager 里追加一个 C++ pass |
+| `nvidia.load_dialects`、`nvidia.passes.ttgpuir.add_to_llvmir` | `nvidia` | NVIDIA 方言，以及 TTGIR 降到 LLVM dialect |
+| `llvm.to_module`、`llvm.optimize_module`、`llvm.translate_to_asm` | `llvm` | LLVM dialect 变成 LLVM IR，再变成 PTX 文本 |
+
+`python -m triton_llm.tt_opt` 对一份 `.mlir` 调用同一张表里的 `passes.*.add_*` 和 `pm.run`。`build/bin/triton-opt` 不走 pybind：`bin/triton-opt.cpp` 经 `RegisterTritonDialects.h` 注册方言和 pass，然后 `MlirOptMain`，调用的是同一批 C++ 构造函数。
+
+## 3. 从 Python 函数到 cubin
+
+默认顺序在 `CUDABackend.add_stages`：`ttir` → `ttgir` → `llir` → `ptx` → `cubin`。这些 stage 里的 pass 是官方 v3.1.0 的。`tl.chip_rcp` 是补丁加的 op，走同一条 stage 顺序，见第 3.5 节。
+
+### 3.1 `ASTSource.make_ir`：建 op
+
+`compile()` 调用 `ASTSource.make_ir`，再调用 `ast_to_ttir`。`CodeGenerator.visit` 通过 `builder.create_*` 把 op 写进模块。这一步还没有 pass。`CompiledKernel.asm["ttir"]` 是后面 `CUDABackend.make_ttir` 跑完之后的文本。
+
+[`lesson.py`](../python/triton_llm/compiler/lesson.py) 把常用 op 放在同一个 kernel 里。[`frontend.py`](../python/triton_llm/compiler/frontend.py) 的 `capture_frontend_ttir` 在 `make_ttir` 之前取出这个模块。`tl.dot` 写成 `tt.dot`，`for` 写成 `scf.for`，`tl.make_block_ptr` 写成 `tt.make_tensor_ptr`。`asm["ttir"]` 里已经没有 `tt.make_tensor_ptr`，因为 `make_ttir` 里的 `--triton-rewrite-tensor-pointer` 把它改成了普通指针上的 load / store。对照在 [`tests/python/test_frontend_middle.py`](../tests/python/test_frontend_middle.py)。
+
+`tl.chip_rcp` 也在这一步建 op：`language/math.py` 调用 `_builder.create_chip_rcp`，`ir.cc` 按 `TT_ChipRcpOp` 写成 `tt.chip_rcp`。之后怎么降到 PTX 见第 3.5 节。`tt.fused_dot_mul` 不是 DSL 里的 `tl.*`，由 `--triton-fuse-dot-epilogue` 从 `tt.dot` 改写出来。
+
+### 3.2 `CUDABackend.make_ttir`
+
+`python -m triton_llm.tt_opt --make-ttir` 执行同一组 pass。跑完仍是 `tt` 方言，张量上没有 layout。
 
 | pass | 作用 |
 |---|---|
-| `inline` | 内联 `tt.call` |
-| `triton-rewrite-tensor-pointer` | `tt.make_tensor_ptr` 改成普通指针上的 load / store |
-| `triton-combine` | 折叠连续的 `addptr`、dot 的累加等 |
-| `canonicalize` | 各 op 自带的常量折叠 |
-| `triton-reorder-broadcast` | 把 `tt.splat` 挪到逐元素运算之后 |
-| `cse`、`licm`、`symbol-dce` | 公共子表达式、循环不变量、无用符号 |
+| `--inline` | 内联 `tt.call` |
+| `--triton-rewrite-tensor-pointer` | `tt.make_tensor_ptr` 改成普通指针上的 load / store |
+| `--triton-combine` | 折叠连续的 `addptr`，以及 dot 的累加 |
+| `--canonicalize` | 各 op 自带的常量折叠 |
+| `--triton-reorder-broadcast` | 把 `tt.splat` 挪到逐元素运算之后 |
+| `--cse`、`--licm`、`--symbol-dce` | 公共子表达式、循环不变量、无用符号 |
 
-```bash
-source .venv/bin/activate
-export PYTHONPATH=python
-python -m triton_llm.tt_opt tests/tt/combine_addptr.mlir --triton-combine
-python -m triton_llm.tt_opt --list --sm 70
-```
+`0002-ttir-passes-llvm19.patch` 另外把四条 TTIR 变换链进了同一个 `.so` 和 `build/bin/triton-opt`。带上对应 flag 时，`build/bin/triton-opt` 和 `python -m triton_llm.tt_opt` 都会跑这些变换。`CUDABackend.make_ttir` 的默认顺序里没有它们，所以 `@triton.jit` 不会跑到。
 
-每个命令行 flag 对应哪个 pass，写在 [`pipeline.py`](../python/triton_llm/compiler/pipeline.py)。
-
-### 4.3 `make_ttgir`
-
-同一个文件里的 `make_ttgir`。`convert-triton-to-tritongpu` 把 `tt` 降到 `triton_gpu`，并给值加上 `#blocked` layout。后面的 pass 做三件事：合并访存、去掉多余的 `convert_layout`、给 `tt.dot` 选择 MMA layout。
-
-`sm // 10 >= 8` 时才会加入 software pipeline，以及 f32 dot 走 tensor core 的 pass。`sm // 10 >= 9` 时才会加入 fence 和 TMA。V100 的 sm 是 70，这四项都不会放进它的 `make_ttgir`。在 V100 上，`num_stages` 只作为 kernel 的启动参数传下去，Triton 的软件流水线 pass 不会执行。对应源码在 `lib/Dialect/TritonGPU/Transforms/Pipeliner/` 和 `lib/Dialect/TritonNvidiaGPU/Transforms/`。本仓库只阅读这两个目录，不编译它们。
-
-lesson kernel 在 sm 70 上经过 `--make-ttir --convert-triton-to-tritongpu --tritongpu-accelerate-matmul` 之后，dot 的 layout 是：
-
-```text
-#triton_gpu.nvidia_mma<{versionMajor = 1, versionMinor = 11, warpsPerCTA = [1, 1], instrShape = [16, 16]}>
-#triton_gpu.dot_op<{opIdx = 0, parent = #mma}>
-triton_gpu.convert_layout
-```
-
-`versionMajor = 1` 是 Volta 的 `mma.sync`。sm 80 是 2，sm 90 的 `wgmma` 是 3。`test_frontend_middle.py` 检查了 `versionMajor = 1` 和 `dot_op` 的 parent。
-
-自己写的 `tt.func` 上还没有 layout 属性，不能作为 `--convert-triton-to-tritongpu` 的输入。要跑这个 pass，输入用 `scripts/dump_triton_ir.py` 写出的 `.ttir`。那份文件已经过 `make_ttir`。
-
-### 4.4 LLVM、PTX、cubin
-
-仍是 `compiler.py` 里的三个函数：
-
-- `make_llir`：`allocate-shared-memory`、`TritonGPUToLLVM`（`third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp`）、`nvgpu-to-llvm` 等，再 `llvm.to_module` 和 O3。Volta 的 `mma.sync` 在 `DotOpToLLVM/MMAv1.cpp`，Hopper 的 `wgmma` 在 `WGMMA.cpp`。`llvm.to_module` 的输出才是 LLVM IR 文本。补丁在这里多了一次调用，见第 4.5 节。
-- `make_ptx`：`llvm.translate_to_asm`，triple `nvptx64-nvidia-cuda`。这是 LLVM 的 NVPTX 后端。
-- `make_cubin`：调用 wheel 里的 `ptxas`。没有对应的 Triton pass。
-
-本仓库不修改 `make_ptx` 和 `make_cubin`。
-
-### 4.5 `tl.chip_rcp`：从 AST 到 LLVM IR
-
-`tt.chip_rcp` 是 `tt` 方言上的 op，属于 TTIR。它不是新方言，也不是 `triton_gpu`。
-
-AST 里没有新的节点类型。新增的是 Python 内建函数 `tl.chip_rcp`。`code_generator.py` 的 `visit_Call` 不用改：它见到 `@builtin` 就把 `_builder` 传进这个函数。内建如果不是函数调用，而是一种新语法，才改 `visit_Call`。`tl.exp` 也是这条接法，只是 `ir.cc` 建的是 `math.exp`，指令在更后面的 `ElementwiseOpToLLVM` 里发出。
-
-| 步骤 | 阶段 | 文件 | 这一步之后的 IR |
-|---|---|---|---|
-| 1 | AST | `language/math.py` 的 `chip_rcp`，`language/__init__.py` 导出为 `tl.chip_rcp` | 还没有 IR。函数只接受 fp32，调用 `_builder.create_chip_rcp` |
-| 2 | 第一份 TTIR | `ir.cc` 的 `create_chip_rcp`，op 定义是 `TritonOps.td` 的 `TT_ChipRcpOp` | `tt.chip_rcp %x : tensor<...xf32> -> tensor<...xf32>`。一个 f32 张量进，一个 f32 张量出 |
-| 3 | `make_ttir` | 第 4.2 节那一串 pass | 仍是 `tt.chip_rcp`。这些 pass 没有针对它的 pattern，张量上还没有 layout |
-| 4 | `make_ttgir` | `convert-triton-to-tritongpu`（`TritonToTritonGPUPass.cpp`） | 给张量加上 layout。op 仍叫 `tt.chip_rcp`，还是 `tt` 方言。`TritonGPUConversion.cpp` 里，没有 layout 的张量是非法的。`tt.chip_rcp` 没有 pattern，转换失败，到不了第 5 步 |
-| 5 | `make_llir` | `ElementwiseOpToLLVM.cpp`，然后 `llvm.to_module` | 上游的 `math.exp` 留到这一步才拆成标量，由 `ExpOpConversionApprox` 发出 `ex2.approx.f32`。`chip.rcp.approx.f32` 应写在同一处。`llvm.to_module` 再把 MLIR 的 LLVM dialect 变成 LLVM IR 文本。之后是第 4.4 节的 `make_ptx`、`make_cubin` |
-| 6 | 本仓库实际跑的 lowering | `LowerChipRcpToLLVM.cpp`，flag `--triton-chip-rcp-to-llvm` | 跳过第 4、5 步，直接在 TTIR 上改写。静态形状、rank 至少为 1 的 f32 张量，每个元素做 `tensor.extract`、`llvm.inline_asm`（汇编串 `chip.rcp.approx.f32 $0, $1`，约束 `=f,f`）、`tensor.insert`。`llvm.inline_asm` 是 MLIR 的 LLVM dialect，还不是 LLVM IR 文本 |
-
-第 6 步的绑定在补丁的 `passes.cc`：`add_lower_chip_rcp`。补丁的 `make_llir` 在 `add_to_llvmir` 之前调用它。已安装的 `compiler.py` 和 `libtriton.so` 没有这次改动。`@triton.jit` 写 `tl.chip_rcp` 时，失败发生在第 2 步：`.venv` 的 `libtriton.so` 没有 `create_chip_rcp`。就算重编并装回这份 `.so`，第 4 步仍然会失败，第 6 步的那一行调用不会被执行到。
-
-现在能跑的检查是 [`tests/tt/chip_rcp.mlir`](../tests/tt/chip_rcp.mlir)。输入是手写的 TTIR，`build/bin/tt-opt --triton-chip-rcp-to-llvm` 执行第 6 步。它不跑 `make_ttir`、`convert-triton-to-tritongpu`、`llvm.to_module` 和 `ptxas`。
-
-## 5. 本仓库的手写 pass：`build/bin/tt-opt`
-
-入口是 [`compiler/tt-opt.cpp`](../compiler/tt-opt.cpp)。它和补丁里的 `AnnotateDotStages.cpp`、`FuseAndTileDot.cpp`、`LowerChipRcpToLLVM.cpp` 编成 `build/bin/tt-opt`，链接静态库 `TritonIR` 和 LLVM 23。不加载 `libtriton.so`。
-
-```bash
-cmake -B build -DTRITON_LLM_CUDA_ARCH=70
-cmake --build build --target tt-opt -j"$(nproc)"
-./build/bin/tt-opt --help
-```
-
-`build/bin/tt-opt` 能解析的方言有 `tt`、`arith`、`func`、`math`、`scf`、`cf`、`tensor`、`llvm`。没有 `triton_gpu`，所以不能读 TTGIR。`--help` 里列出的 pass 就是这里注册的：`canonicalize` 和下面五个。
-
-| flag | 作用 |
+| flag | 变换 |
 |---|---|
 | `--triton-annotate-dot-stages` | 每个 `tt.dot` 写上 `triton_llm.num_stages`：`sm < 80` 为 2，否则 3 |
 | `--triton-fuse-dot-epilogue` | 单次使用的 `tt.dot` 乘一个同类型标量，改写成 `tt.fused_dot_mul` |
 | `--triton-lower-fused-dot-mul` | 展开回 `tt.dot` 和循环外的乘法 |
-| `--triton-tile-dot` | K 能被 `BLOCK_K` 整除时，改成 `scf.for` + `tensor.extract_slice` + 内层 `tt.dot` |
-| `--triton-chip-rcp-to-llvm` | 静态形状的 f32 `tt.chip_rcp` 改成逐元素的 `llvm.inline_asm`，汇编串是 `chip.rcp.approx.f32` |
-
-`tt.fused_dot_mul` 加在 `tt` 方言上，不是新方言。操作数 `c`、`scale` 和结果的类型必须相同。
-
-tile 的候选写在 `FuseAndTileDot.cpp` 的 `gemmTileForSm`，和 [`arch/tiling.py`](../python/triton_llm/arch/tiling.py) 是同一组。每个四元组依次是 `BLOCK_M`、`BLOCK_N`、`BLOCK_K`、`num_stages`：`(64,64,32,2)`、`(64,128,32,2)`、`(128,128,32,2)`、`(128,128,64,2)`、`(128,128,64,3)`。从前往后看，最后一个放得进 shared memory、并且 stage 数不超过该 sm 上限的候选被选中。每个 sm 只对应其中一个候选，运行时不再搜索。sm 70 和 sm 90 选中的都是 `BLOCK_K=64`，stage 分别是 2 和 3。这两个属性写在 `scf.for` 结尾的 `}` 上。`tests/python/test_tile_table_sync.py` 对 sm 70、75、80、86、90 比较这两份表。
-
-这些 flag 来自补丁改过的 `Passes.td`。补丁打完之后，文件在 `build/triton-patched/include/triton/Dialect/Triton/Transforms/Passes.td`。命令行写成 `--triton-annotate-dot-stages=sm=90` 时，MLIR 先用默认的 sm 构造 pass，再把 `sm=90` 写进这个 pass 的选项。
-
-补丁里的 `passes.cc` 写了 `add_annotate_dot_stages` 和 `add_lower_chip_rcp`。已安装的 `libtriton.so` 里没有这两个函数。融合和切分没有 `add_*`。`make_ttir` 的顺序和已安装的 Triton 相同，所以 `python -m triton_llm.tt_opt --make-ttir` 和 `@triton.jit` 用的是同一串 TTIR pass。`tl.chip_rcp` 见第 4.5 节。
-
-### 5.1 再加一个 pass
-
-1. `Passes.td` 里加 pass 名和构造函数。
-2. 新的 `.cpp` 里写 pass 类和 `create*Pass()`。可以照 `AnnotateDotStages.cpp`：`GEN_PASS_DECL`、`GEN_PASS_DEF`，然后 `runOnOperation`。
-3. `compiler/tt-opt.cpp` 里再 `registerPass` 一次。新方言也要放进同一个 `DialectRegistry`。
-4. 把 `.cpp` 加进 `compiler/CMakeLists.txt` 的 `add_executable(tt-opt ...)`。
-5. 在 `tests/tt/` 里放 `.mlir`。`// RUN:` 行写 `TT_OPT_CPP`，不要写单词 `tt-opt`。`tests/shell/run_tt_opt_tests.sh` 先把单词 `tt-opt` 换成 `python -m triton_llm.tt_opt`，再把 `TT_OPT_CPP` 换成 `build/bin/tt-opt`。写成 `tt-opt` 时，脚本会去调用 `python -m triton_llm.tt_opt`，那个进程里的 `libtriton.so` 没有这个新 pass。
+| `--triton-tile-dot` | K 能被 `BLOCK_K` 整除时，把整张量 `tt.dot` 改成 `scf.for` + `tensor.extract_slice` + 内层 `tt.dot`。输出仍是 TTIR |
 
 ```bash
-cmake --build build --target tt-opt -j"$(nproc)"
+./build/bin/triton-opt tests/tt/annotate_dot_stages.mlir --triton-annotate-dot-stages
+python -m triton_llm.tt_opt tests/tt/fuse_dot_epilogue.mlir --triton-fuse-dot-epilogue
+python -m triton_llm.tt_opt tests/tt/annotate_dot_stages_sm90.mlir --triton-annotate-dot-stages=sm=90
+```
+
+`--triton-tile-dot` 的输出仍是 TTIR，不进入 `make_ttgir`。kernel 里进入 MMA 的切块是 DSL 自己的循环，见第 3.3 节。
+
+要让一条新 pass 跟着 `@triton.jit` 跑，先按第 4 节把它链进 `.so`，再在 `CUDABackend.make_ttir` 或 `make_ttgir` 里调用它的 `add_*`。上面四条只由 flag 调用。
+
+### 3.3 Tile，以及 `CUDABackend.make_ttgir`
+
+切块写在 DSL 里，发生在 pass 之前。[`lesson.py`](../python/triton_llm/compiler/lesson.py) 的 `for k0 in range(0, K, BLOCK_K)` 和循环内的 `tl.dot`，由 `ASTSource.make_ir` 写成 `scf.for` 和一块 `tt.dot`。`BLOCK_M`、`BLOCK_N`、`BLOCK_K`、`num_stages` 来自 [`arch/tiling.py`](../python/triton_llm/arch/tiling.py) 的 `choose_gemm_tile`。sm 70 上是 `BLOCK_M=128`、`BLOCK_N=128`、`BLOCK_K=64`、`num_stages=2`。C++ 里的同一张表是 `gemmTileForSm`，`tests/python/test_tile_table_sync.py` 核对两边一致。
+
+`CUDABackend.make_ttir` 不改变这块 tile 的形状。`CUDABackend.make_ttgir` 给已经切好的 `tt.dot` 选 layout。V100（sm 70）上和这块 tile 有关的 pass：
+
+| pass | 作用 |
+|---|---|
+| `--convert-triton-to-tritongpu` | 按块形状加上 `#blocked` |
+| `--tritongpu-coalesce` | 合并访存 |
+| `--tritongpu-accelerate-matmul` | 把 `tt.dot` 的 layout 换成 `#triton_gpu.nvidia_mma` |
+| `--tritongpu-optimize-dot-operands` | 调整 dot 两个操作数的 layout。sm 70 不使用 sm ≥ 80 那条操作数路径 |
+
+`make_ttgir` 在 sm ≥ 80 时加入 `tritongpu-f32-dot-tc` 和 `tritongpu-pipeline`，在 sm ≥ 90 时再加入 fence 与 TMA。同一函数里还有 `tritongpu-plan-cta`、`tritongpu-remove-layout-conversions`、`tritongpu-optimize-thread-locality`、`tritongpu-prefetch`、`tritongpu-reduce-data-duplication`、`tritongpu-reorder-instructions`，以及 `cse`、`symbol-dce`、`canonicalize`。sm 70 不跑 `tritongpu-pipeline`，所以 `num_stages` 不参与这次 lowering。`choose_gemm_tile` 仍返回 `num_stages`，它作为编译选项传给 `CUDABackend`，sm ≥ 80 时 `add_pipeline` 才读取。
+
+sm 70 上 `tritongpu-accelerate-matmul` 把 `tt.dot` 标成 `#triton_gpu.nvidia_mma<{versionMajor = 1, ...}>`。`AccelerateMatmul.cpp` 的 `getMMAVersionSafe` 按 sm 取值：低于 75 为 1（Volta 的 `mma.sync`），75 到 89 为 2，90 及以上为 3（`wgmma`）。第 3.4 节把 version 1 写成 `mma.sync.aligned.m8n8k4`。`test_own_libtriton_tiles_dot_through_ttgir_to_llvm` 用 `choose_gemm_tile(70)` 检查 `versionMajor = 1` 和这条 PTX。
+
+同一阶段里，`TritonToTritonGPUPass.cpp` 的 `GenericOpPattern<ChipRcpOp>` 给 `tt.chip_rcp` 的结果张量加上 layout，op 名字不变。第 3.4 节读的是这份带 layout 的 TTGIR。
+
+### 3.4 `CUDABackend.make_llir`、`make_ptx`、`make_cubin`
+
+这三个方法也在 `nvidia/backend/compiler.py`。
+
+- `make_llir`：先跑 `scf-to-cf`、`allocate-shared-memory`，再 `nvidia.passes.ttgpuir.add_to_llvmir`（`TritonGPUToLLVM.cpp`）、`nvgpu-to-llvm`、`arith-to-llvm`。然后 `llvm.to_module` 和 `llvm.optimize_module(..., OPTIMIZE_O3)`。Volta 的 f16 `tt.dot` 在 `DotOpToLLVM/MMAv1.cpp` 里写成 `mma.sync.aligned.m8n8k4`。
+- `make_ptx`：`llvm.translate_to_asm`，triple `nvptx64-nvidia-cuda`。
+- `make_cubin`：Python 用子进程调用 `triton/backends/nvidia/bin/ptxas`。这一步不进入 `libtriton.so`。
+
+### 3.5 `tl.chip_rcp`：从 DSL 降到 `rcp.approx.ftz.f32`
+
+`0001-frontend-llvm19.patch` 增加 `tl.chip_rcp`，只接受 fp32。DSL 里的名字是 `chip_rcp`，PTX opcode 是 `rcp`。它走过第 3.1 节到第 3.4 节，中间没有单独的 flag：
+
+| 阶段 | `.so` 里发生的事 | 这一步之后 |
+|---|---|---|
+| `ASTSource.make_ir` | `ir.cc` 的 `create_chip_rcp` 建 `TT_ChipRcpOp` | `tt.chip_rcp`，张量上没有 layout |
+| `CUDABackend.make_ttir` | 第 3.2 节默认的那组 pass 不改这个 op | 仍是 `tt.chip_rcp` |
+| `CUDABackend.make_ttgir` | `GenericOpPattern<ChipRcpOp>` | 张量带上 layout，op 名字不变 |
+| `CUDABackend.make_llir` | `ElementwiseOpToLLVM.cpp` 的 `ChipRcpOpConversion`，由 `add_to_llvmir` 执行 | f32 元素写成 `rcp.approx.ftz.f32` |
+| `make_ptx`、`make_cubin` | `llvm.translate_to_asm`，然后 `ptxas` | PTX 里是同一条指令，cubin 非空 |
+
+CodeGen 写的是：
+
+```cpp
+ptxBuilder.create<PTXInstr>("rcp")->o("approx").o("ftz").o("f32");
+```
+
+`PTXInstr` 的第一个参数是 opcode，后面每个 `.o(...)` 是一个点号修饰符，拼出来是 `rcp.approx.ftz.f32`。`rcp` 是 PTX 的倒数，`.approx` 是近似，`.ftz` 把次正规数刷成 0，`.f32` 和这个函数只接受 fp32 一致。f32 的 `rcp.approx` 带 `.ftz`，`ptxas` 才接受这条指令。
+
+`ChipRcpOpConversion` 写在 `ElementwiseOpToLLVM.cpp`，由 `add_to_llvmir` 调用，接法和 `tl.exp` 相同。opcode 用 PTX 已有的 `rcp`。换一套指令集时换 backend，见第 4 节。
+
+`test_chip_rcp_lowers_through_ttgir_to_cubin` 检查：`ttir` 和 `ttgir` 里有 `tt.chip_rcp`，`llir` 和 `ptx` 里有 `rcp.approx.ftz.f32`，cubin 非空。
+
+## 4. `triton-opt`，以及换成自己的 GPU backend
+
+1.2 节那次 pip 安装里的 cmake，把同一份 pass 的 `.cpp` 链进 `libtriton.so` 和 `build/bin/triton-opt`。官方 wheel 不带 `triton-opt`。仓库根目录的 cmake 不参与。
+
+一条新 pass 要同时进这两个产物，改的是 `build/triton-src` 里的这些文件：
+
+1. 在 `include/triton/Dialect/Triton/Transforms/Passes.td` 声明，在 `lib/Dialect/Triton/Transforms/` 实现。类放在 `namespace mlir::triton`，构造函数写成 `mlir::triton::create*Pass()`，pattern 用 `applyPatternsAndFoldGreedily`。
+2. 把 `.cpp` 加进该目录的 `CMakeLists.txt`，并在 `python/src/passes.cc` 增加 `add_*`。
+3. `bin/RegisterTritonDialects.h` 已经注册 Triton 的 pass，flag 随 `Passes.td` 出现在 `triton-opt --help` 里。
+4. 把改动写成补丁，再跑 `scripts/build_libtriton.sh`。`@triton.jit` 要跑到它，还得在 `make_ttir` 或 `make_ttgir` 里调用这个 `add_*`，见第 3.2 节。
+
+`tests/tt/` 里的 `// RUN:` 指定用哪个程序跑这条测试。`tests/shell/run_tt_opt_tests.sh` 把其中的 `tt-opt` 换成 `python -m triton_llm.tt_opt`，把 `TT_OPT_CPP` 换成 `build/bin/triton-opt`。
+
+芯片厂商如果沿用 Triton 的 Python 前端，`@triton.jit` 的写法可以保留。要替换的是 backend：在 `BaseBackend.add_stages` 里换成自己的 pass 顺序，用 `DriverBase` 在自己的设备上启动 kernel。NVIDIA 在 `TritonToTritonGPUPass.cpp` 和 `TritonGPUToLLVM.cpp` 的前面和后面插入 pass。换成另一种 GPU 时，才需要自己的 GPU dialect，以及降到自己指令集的 lowering。
+
+[`python/triton_llm/backend/fakegpu/`](../python/triton_llm/backend/fakegpu/) 里的 `FakeGPUBackend` 实现了上述两个接口。`FakeGPUDriver.is_active()` 返回 false，因此 `import triton` 时 `_create_driver()` 仍然只构造 `CudaDriver`。`activate()` 调用 `driver.set_active(FakeGPUDriver())`，离开 `with` 时恢复原先的 driver。`_discover_backends()` 只扫描 `triton/backends/` 下的目录，所以 `register()` 把这个 backend 写入 `triton.backends.backends["fakegpu"]`。
+
+`FakeGPUBackend.add_stages` 的三个阶段：
+
+1. `ttir`：调用 `.so` 里的 `passes.ttir` / `passes.common`，顺序和第 3.2 节的默认顺序相同，不含 `--triton-annotate-dot-stages`、`--triton-fuse-dot-epilogue`、`--triton-lower-fused-dot-mul`、`--triton-tile-dot`。
+2. `fakeasm`：`lower_ttir` 按 TTIR 中 op 的出现顺序各写一条指令。`FAKE_OPCODES` 的对应是 `scf.for` → `fake.loop`，`tt.dot` → `fake.dot`，`tt.chip_rcp` → `fake.rcp.f32`。这张表的角色与 `ChipRcpOpConversion`、`DotOpToLLVM` 相同：op 到机器指令的映射。该阶段不建 `triton_gpu` dialect，也不调用 `llvm.translate_to_asm`。
+3. `fakegpu`：把这份文本编码成 `bytes`。`CompiledKernel.asm["fakegpu"]` 就是这些字节。
+
+`FakeGPUDriver.get_current_device` 返回 99，所以 `JITFunction` 把结果放进 `self.cache[99]`，和 CUDA 的 `self.cache[0]` 分开。`load_binary` 把字节原样返回，`FakeLauncher` 把网格记进 `LAUNCHES`。示例是 [`lesson.py`](../python/triton_llm/backend/fakegpu/lesson.py) 的 `_fake_gpu_lesson`：
+
+```python
+from triton_llm.backend.fakegpu.lesson import compile_fake_gpu_lesson
+
+kernel = compile_fake_gpu_lesson()
+print(kernel.asm["ttir"])
+print(kernel.asm["fakeasm"])
+```
+
+`tests/python/test_fake_gpu_backend.py` 检查 `ttir` 含 `tt.chip_rcp`、`scf.for`、`tt.dot`，且 `fakeasm` 中 `fake.loop`、`fake.load`、`fake.dot`、`fake.yield`、`fake.rcp.f32`、`fake.store` 按此顺序出现。接到真实设备时，`add_stages` 还要加入该设备的 dialect 转换和汇编，`DriverBase.load_binary` 在设备上加载二进制。`activate()` 之外，`@triton.jit` 使用 `CUDABackend`。
+
+## 5. 命令
+
+先安装两个包（第 1 节），再跑 IR 和 pytest。`ctest` 使用仓库根目录的 CMake：它再跑一遍 shell 测试和 pytest，并加上 CUTLASS。`libtriton.so` 不由这次 cmake 编译。
+
+```bash
+git submodule update --init third_party/triton
+scripts/setup_venv.sh
+source .venv/bin/activate
+
+./build/bin/triton-opt tests/tt/fuse_dot_epilogue.mlir --triton-fuse-dot-epilogue
+python -m triton_llm.tt_opt tests/tt/annotate_dot_stages.mlir --triton-annotate-dot-stages
 ./tests/shell/run_tt_opt_tests.sh
+
+pytest tests/python/test_frontend_middle.py
+pytest tests/python/test_own_libtriton.py
+pytest tests/python/test_fake_gpu_backend.py
+pytest tests/python/test_python_cpp_handoff.py
+pytest tests/python/test_so_handwritten_passes.py
+pytest tests/python/test_tile_table_sync.py
+
+cmake -B build -DTRITON_LLM_CUDA_ARCH=70
+cmake --build build -j"$(nproc)"
+ctest --test-dir build
 ```
 
-Python 取出的 TTIR 可以直接交给这个二进制：
+看 `@triton.jit` 每个 stage 的 IR：
 
 ```bash
-PYTHONPATH=python python - <<'EOF'
-from pathlib import Path
-from triton_llm.compiler.frontend import capture_frontend_ttir
-from triton_llm.compiler.lesson import _frontend_lesson, launch_frontend_lesson
-Path("/tmp/lesson.mlir").write_text(capture_frontend_ttir(_frontend_lesson, launch_frontend_lesson))
-EOF
-./build/bin/tt-opt /tmp/lesson.mlir --triton-annotate-dot-stages
+MLIR_ENABLE_DUMP=1 TRITON_ALWAYS_COMPILE=1 python scripts/dump_triton_ir.py
 ```
 
-`tests/python/test_python_cpp_handoff.py` 检查 `tt.dot` 上写出了 `triton_llm.num_stages`。
-
-## 6. 改哪个文件，哪个程序会重新编译
-
-| 改动 | `@triton.jit` | `python -m triton_llm.tt_opt` | `build/bin/tt-opt` |
-|---|---|---|---|
-| `python/triton_llm/ops/*.py` | 会。下次调用该 kernel 时重新编译 | 不会 | 不会 |
-| `arch/tiling.py` | 会 | 不会 | 不会。要和 `FuseAndTileDot.cpp` 一起改。`test_tile_table_sync.py` 会检查两份表是否一致 |
-| 补丁里的 pass、`Passes.td`、`TritonOps.td`、`compiler/tt-opt.cpp` | 不会 | 不会 | 会。`cmake --build build --target tt-opt` |
-| submodule 工作区里的其余 `.cpp`，以及其中的 `compiler.py`、`code_generator.py` | 不会 | 不会 | 不会。这些文件没有被任何进程加载。`@triton.jit` 读的是 `.venv` 里安装的同名文件 |
-| 重编 Triton 并换掉 `libtriton.so` | 会，缓存全部失效 | 会 | 不会 |
-
-## 7. 调试、测试，以及本仓库没有做的
+改了 `build/triton-src` 里的 C++（`create_chip_rcp`、`ChipRcpOpConversion`、`gemmTileForSm`、四个 TTIR pass）之后，重新生成对应补丁，再编一次 `.so`，然后从 `triton-opt` 往下复测：
 
 ```bash
-./build/bin/tt-opt tests/tt/fuse_dot_epilogue.mlir --triton-fuse-dot-epilogue --mlir-print-ir-after-all
-MLIR_ENABLE_DUMP=1 TRITON_ALWAYS_COMPILE=1 PYTHONPATH=python python scripts/dump_triton_ir.py
+scripts/build_libtriton.sh
+./build/bin/triton-opt tests/tt/fuse_dot_epilogue.mlir --triton-fuse-dot-epilogue
+./tests/shell/run_tt_opt_tests.sh
+pytest tests/python/test_own_libtriton.py
 ```
 
-| 命令 | 内容 |
-|---|---|
-| `./tests/shell/run_tt_opt_tests.sh` | `tests/tt/*.mlir` |
-| `pytest tests/python/test_frontend_middle.py` | 前端 op、rewrite-tensor-pointer、Volta MMA layout |
-| `pytest tests/python/test_python_cpp_handoff.py` | 前端 TTIR 送给 `build/bin/tt-opt` |
-| `pytest tests/python/test_tile_table_sync.py` | 两份 tile 表一致 |
-| `ctest --test-dir build` | 上面这些，加上 CUTLASS 和数值测试 |
+块大小写在两处。kernel 用 `choose_gemm_tile`，`--triton-tile-dot` 用 `gemmTileForSm`。两处一起改时，编完再跑 `pytest tests/python/test_tile_table_sync.py`。
 
-| 现象 | 原因 |
-|---|---|
-| `Dialect 'triton_gpu' not found`（`build/bin/tt-opt`） | 这个二进制没有注册 `triton_gpu`。TTGIR 交给 `python -m triton_llm.tt_opt` |
-| `unknown pass --triton-tile-dot`（`python -m triton_llm.tt_opt`） | 手写 pass 只在 `build/bin/tt-opt`。`// RUN:` 要写 `TT_OPT_CPP` |
-| `AttributeError: add_annotate_dot_stages` | 已安装的 `libtriton.so` 没有这个函数 |
-| 改了 submodule 里的 `code_generator.py`，kernel 的编译结果没变 | `@triton.jit` 加载的是 `.venv` 里的 Python 文件和 `libtriton.so` |
-| 期望中的 pass 没有执行 | `~/.triton/cache` 里已有编译结果。设 `TRITON_ALWAYS_COMPILE=1` 后会重新编译 |
+`build_libtriton.sh` 编译的是 `build/triton-src`，不是 `third_party/triton` 的工作区。工作区上的修改要先写成补丁，打进 `build/triton-src`，再执行上面的命令。
 
-本仓库没有单独实现、也没有测试的：
+## 6. 主要入口函数
 
-- 自己写的 DialectConversion。上游的 TTIR→TTGIR 在 `TritonToTritonGPUPass.cpp`，由已安装的 `.so` 执行。
-- software pipeline、fence、TMA。V100 上不会跑。
-- 自定义 `BaseBackend`。现在用的是 wheel 里的 NVIDIA backend。
-- 编译并运行上游的 `triton-opt` 和 lit。源码在 submodule 的 `bin/` 和 `test/`，测试仍用上面的 shell 脚本读 `// RUN:`。
-- 把手写 pass 编进 `libtriton.so` 并在对应 stage 里调用。对照见第 2.2 节。`tl.chip_rcp` 见第 4.5 节。
+下表里 Triton 的路径相对于 `third_party/triton/`。补丁改过的文件以 `build/triton-src/` 里的同名路径为准。本仓库的路径相对于仓库根目录。
+
+| 作用 | 函数 | 文件 |
+|---|---|---|
+| `@triton.jit` 何时编译、何时启动 | `JITFunction.run` | `python/triton/runtime/jit.py` |
+| 选中哪一个 backend、按什么顺序跑 stage | `compile`、`make_backend` | `python/triton/compiler/compiler.py` |
+| DSL 函数生成 TTIR 模块 | `ASTSource.make_ir`、`ast_to_ttir` | `python/triton/compiler/compiler.py`、`python/triton/compiler/code_generator.py` |
+| 默认 pass 顺序（TTIR → TTGIR → LLVM → PTX → cubin） | `CUDABackend.add_stages`、`make_ttir`、`make_ttgir`、`make_llir`、`make_ptx`、`make_cubin` | `third_party/nvidia/backend/compiler.py` |
+| 增加一个 `tl.*`，并在 `.so` 里建 op | `chip_rcp`、`create_chip_rcp` | `python/triton/language/math.py`、`python/src/ir.cc`（`0001`） |
+| 这个 op 在 TTGIR 上拿到 layout | `GenericOpPattern<ChipRcpOp>` | `lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp`（`0001`） |
+| 这个 op 写成 PTX 指令 | `ChipRcpOpConversion` | `third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp`（`0001`） |
+| 一块 `tt.dot` 写成 Volta MMA | `MMAv1` 的 lowering | `third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv1.cpp` |
+| kernel 里的切块从哪来 | `_frontend_lesson` 的 `for` / `tl.dot`；`choose_gemm_tile` | `python/triton_llm/compiler/lesson.py`、`python/triton_llm/arch/tiling.py` |
+| 命令行上的四条 TTIR 变换 | `createAnnotateDotStagesPass`、`gemmTileForSm` | `lib/Dialect/Triton/Transforms/AnnotateDotStages.cpp`、`FuseAndTileDot.cpp`（`0002`） |
+| 这四条变换怎么从 Python 调进 `.so` | `add_annotate_dot_stages` 等 | `python/src/passes.cc`（`0002`） |
+| 换成自己的 backend | `FakeGPUBackend.add_stages`、`lower_ttir`；`FakeGPUDriver.get_current_target` | `python/triton_llm/backend/fakegpu/compiler.py`、`driver.py` |
+
+`FAKE_OPCODES` 定义 op 到 `fake.*` 指令的映射，对应 C++ 里的 `ChipRcpOpConversion`。`FakeGPUBackend` 的最后一阶段把这些指令编码成字节，不调用 `ptxas`。

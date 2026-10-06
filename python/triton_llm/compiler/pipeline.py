@@ -1,10 +1,8 @@
-"""Pass list for ``tt-opt``.
+"""Pass list for ``python -m triton_llm.tt_opt``.
 
 Flags that call ``passes.ttir`` / ``passes.ttgpuir`` execute the C++ pass
-inside the installed Triton 3.1 ``libtriton.so``. The source of each pass
-is the file in ``third_party/triton/``. The handwritten
-``--triton-annotate-dot-stages`` pass is ``build/bin/tt-opt``, not a flag
-on this driver.
+inside this repo's ``libtriton.so``. The four handwritten TTIR passes are
+in that ``.so`` as well. ``--make-ttir`` does not call them.
 
 ``--make-ttir`` and ``--make-ttgir`` expand to the order in
 ``CUDABackend.make_ttir`` / ``make_ttgir``. That order does not include
@@ -116,6 +114,30 @@ def _add_tma(pm, options: PassOptions) -> None:
     nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
 
 
+def _add_annotate(pm, options: PassOptions) -> None:
+    from triton._C.libtriton import passes
+
+    passes.ttir.add_annotate_dot_stages(pm, options.sm)
+
+
+def _add_fuse(pm, options: PassOptions) -> None:
+    from triton._C.libtriton import passes
+
+    passes.ttir.add_fuse_dot_epilogue(pm)
+
+
+def _add_lower_fused(pm, options: PassOptions) -> None:
+    from triton._C.libtriton import passes
+
+    passes.ttir.add_lower_fused_dot_mul(pm)
+
+
+def _add_tile(pm, options: PassOptions) -> None:
+    from triton._C.libtriton import passes
+
+    passes.ttir.add_tile_dot(pm, options.sm)
+
+
 def step(flag: str, summary: str, source: str, add) -> PassStep:
     return PassStep(flag, summary, source, _cpp(add))
 
@@ -123,6 +145,30 @@ def step(flag: str, summary: str, source: str, add) -> PassStep:
 # Individual passes. ``--make-ttir`` / ``--make-ttgir`` reference these flags.
 STEPS = [
     step("--inline", "MLIR inliner", "upstream MLIR", _bind_common("add_inliner")),
+    step(
+        "--triton-annotate-dot-stages",
+        "stamp triton_llm.num_stages on tt.dot; sm<80 -> 2, else 3",
+        "lib/Dialect/Triton/Transforms/AnnotateDotStages.cpp",
+        _add_annotate,
+    ),
+    step(
+        "--triton-fuse-dot-epilogue",
+        "fold arith.mulf of a single-use tt.dot into tt.fused_dot_mul",
+        "lib/Dialect/Triton/Transforms/FuseAndTileDot.cpp",
+        _add_fuse,
+    ),
+    step(
+        "--triton-lower-fused-dot-mul",
+        "expand tt.fused_dot_mul back to tt.dot and arith.mulf",
+        "lib/Dialect/Triton/Transforms/FuseAndTileDot.cpp",
+        _add_lower_fused,
+    ),
+    step(
+        "--triton-tile-dot",
+        "tile a whole-tensor tt.dot into scf.for + tensor.extract_slice; stays in TTIR",
+        "lib/Dialect/Triton/Transforms/FuseAndTileDot.cpp",
+        _add_tile,
+    ),
     step(
         "--triton-rewrite-tensor-pointer",
         "tt.make_tensor_ptr / tt.advance -> tt.load of tensor<!tt.ptr>",

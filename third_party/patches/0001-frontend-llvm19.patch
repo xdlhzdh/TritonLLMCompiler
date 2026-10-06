@@ -1,0 +1,127 @@
+diff -ruN a/include/triton/Dialect/Triton/IR/TritonOps.td b/include/triton/Dialect/Triton/IR/TritonOps.td
+--- a/include/triton/Dialect/Triton/IR/TritonOps.td	2026-10-06 17:55:46.252280199 +0800
++++ b/include/triton/Dialect/Triton/IR/TritonOps.td	2026-10-06 17:55:46.313815921 +0800
+@@ -141,6 +141,14 @@
+     let assemblyFormat = "$x `,` $min `,` $max `,` `propagateNan` `=` $propagateNan attr-dict `:` type($result)";
+ }
+ 
++// Elementwise reciprocal approximation. CodeGen emits PTX rcp.approx.ftz.f32.
++def TT_ChipRcpOp : TT_Op<"chip_rcp", [Pure, SameOperandsAndResultType]> {
++  let summary = "f32 reciprocal approximation";
++  let arguments = (ins RankedTensorOf<[F32]>:$src);
++  let results = (outs RankedTensorOf<[F32]>:$result);
++  let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
++}
++
+ //
+ // Math Ops
+ //
+diff -ruN a/lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp b/lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp
+--- a/lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp	2026-10-06 17:55:46.271371406 +0800
++++ b/lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp	2026-10-06 17:55:46.315270232 +0800
+@@ -536,6 +536,7 @@
+       TritonBroadcastPattern, GenericOpPattern<triton::AddPtrOp>,
+       TritonCatPattern, TritonJoinOpPattern, TritonSplitOpPattern,
+       GenericOpPattern<triton::ClampFOp>,
++      GenericOpPattern<triton::ChipRcpOp>,
+       GenericOpPattern<triton::PreciseSqrtOp>,
+       GenericOpPattern<triton::PreciseDivFOp>,
+       GenericOpPattern<triton::MulhiUIOp>,
+diff -ruN a/python/src/ir.cc b/python/src/ir.cc
+--- a/python/src/ir.cc	2026-10-06 17:55:46.257213130 +0800
++++ b/python/src/ir.cc	2026-10-06 17:55:46.314311315 +0800
+@@ -1407,6 +1407,10 @@
+            [](TritonOpBuilder &self, Value &val) -> Value {
+              return self.create<math::ExpOp>(val);
+            })
++      .def("create_chip_rcp",
++           [](TritonOpBuilder &self, Value &val) -> Value {
++             return self.create<triton::ChipRcpOp>(val.getType(), val);
++           })
+       .def("create_exp2",
+            [](TritonOpBuilder &self, Value &val) -> Value {
+              return self.create<math::Exp2Op>(val);
+diff -ruN a/python/triton/language/__init__.py b/python/triton/language/__init__.py
+--- a/python/triton/language/__init__.py	2026-10-06 17:55:46.261504388 +0800
++++ b/python/triton/language/__init__.py	2026-10-06 17:55:46.314815572 +0800
+@@ -104,7 +104,7 @@
+     where,
+ )
+ from .math import (umulhi, exp, exp2, fma, log, log2, cos, rsqrt, sin, sqrt, sqrt_rn, abs, fdiv, div_rn, erf, floor,
+-                   ceil)
++                   ceil, chip_rcp)
+ from .random import (
+     pair_uniform_to_normal,
+     philox,
+@@ -146,6 +146,7 @@
+     "cast",
+     "cdiv",
+     "ceil",
++    "chip_rcp",
+     "clamp",
+     "const",
+     "const_pointer_type",
+diff -ruN a/python/triton/language/math.py b/python/triton/language/math.py
+--- a/python/triton/language/math.py	2026-10-06 17:55:46.266436899 +0800
++++ b/python/triton/language/math.py	2026-10-06 17:55:46.315028756 +0800
+@@ -93,6 +93,16 @@
+ 
+ 
+ @core.builtin
++@_check_dtype(dtypes=["fp32"])
++@_add_math_1arg_docstr("reciprocal approximation")
++@core._tensor_member_fn
++def chip_rcp(x, _builder=None):
++    """Elementwise f32 reciprocal approximation. Lowers through TTIR and TTGIR to PTX rcp.approx.ftz.f32."""
++    x = core._to_tensor(x, _builder)
++    return core.tensor(_builder.create_chip_rcp(x.handle), x.type)
++
++
++@core.builtin
+ @_check_dtype(dtypes=["fp32", "fp64"])
+ @_add_math_1arg_docstr("exponential")
+ @core._tensor_member_fn
+diff -ruN a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp	2026-10-06 17:55:46.276343697 +0800
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp	2026-10-06 17:55:46.315607811 +0800
+@@ -903,6 +903,32 @@
+ private:
+   StringRef funcName;
+ };
++
++struct ChipRcpOpConversion
++    : ElementwiseOpConversionBase<ChipRcpOp, ChipRcpOpConversion> {
++  using Base = ElementwiseOpConversionBase<ChipRcpOp, ChipRcpOpConversion>;
++  using Base::Base;
++  using Adaptor = typename Base::OpAdaptor;
++
++  // Runs inside add_to_llvmir, after convert-triton-to-tritongpu has attached
++  // layouts. The opcode is real PTX so ptxas can assemble the kernel.
++  SmallVector<Value> createDestOps(ChipRcpOp op, OpAdaptor adaptor,
++                                   ConversionPatternRewriter &rewriter,
++                                   Type elemTy, MultipleOperandsRange operands,
++                                   Location loc) const {
++    if (!elemTy.isF32())
++      return {};
++
++    PTXBuilder ptxBuilder;
++    auto &rcp =
++        ptxBuilder.create<PTXInstr>("rcp")->o("approx").o("ftz").o("f32");
++    auto output = ptxBuilder.newOperand("=f");
++    auto input = ptxBuilder.newOperand(operands[0][0], "f");
++    rcp(output, input);
++    return {ptxBuilder.launch(rewriter, loc, f32_ty, false)};
++  }
++};
++
+ } // namespace
+ } // namespace gpu
+ 
+@@ -946,6 +972,7 @@
+       benefit);
+   mlir::triton::populateClampFOpToLLVMPattern(
+       typeConverter, patterns, axisInfoAnalysis, targetInfo, benefit);
++  patterns.add<ChipRcpOpConversion>(typeConverter, axisInfoAnalysis, benefit);
+ }
+ 
+ void mlir::triton::NVIDIA::populateClampFOpToLLVMPattern(

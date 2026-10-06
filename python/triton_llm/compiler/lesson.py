@@ -62,12 +62,16 @@ def launch_frontend_lesson(
     block_m: int = 16,
     block_n: int = 16,
     block_k: int = 16,
+    num_stages: int | None = None,
 ) -> torch.Tensor:
     """Launch one tile. ``tl.dot`` requires both non-batch dimensions to be >= 16."""
     a = torch.randn(m, k, device="cuda", dtype=torch.float16)
     b = torch.randn(k, n, device="cuda", dtype=torch.float16)
     c = torch.randn(m, n, device="cuda", dtype=torch.float16)
     out = torch.empty(m, n, device="cuda", dtype=torch.float32)
+    launch = {}
+    if num_stages is not None:
+        launch["num_stages"] = num_stages
     _frontend_lesson[(1, )](
         a, b, c, out,
         m, n, k,
@@ -76,5 +80,6 @@ def launch_frontend_lesson(
         c.stride(0), c.stride(1),
         out.stride(0), out.stride(1),
         BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
+        **launch,
     )
     return out
