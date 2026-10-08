@@ -122,7 +122,7 @@ python -m triton_llm.tt_opt --sm 70 --num-warps 4 --num-stages 2 --num-ctas 1 \
 | `--triton-lower-fused-dot-mul` | 同上 | 展开回 `tt.dot` 和循环外的 `arith.mulf` |
 | `--triton-tile-dot` | 同上 | 静态二维 `tt.dot` 在 K 能被 `BLOCK_K` 整除时改写成 `scf.for` + `tensor.extract_slice`。`triton_llm.block_k` 和 `triton_llm.num_stages` 写在 `scf.for` 上。这份 IR 停在 TTIR |
 
-四个手写 TTIR pass 在 `libtriton.so` 和 `build/bin/triton-opt` 里都能用同名 flag 调用。`CUDABackend.make_ttir` 不跑它们。lesson kernel 用 `choose_gemm_tile` 的 `BLOCK_*`，由这份 `.so` 经 TTGIR 到 `mma.sync.aligned.m8n8k4`，见 [`docs/triton_mlir_path.md`](docs/triton_mlir_path.md) 第 3.3 节。`tl.chip_rcp` 见第 3.5 节。假的自有 GPU backend 在 `python/triton_llm/backend/fakegpu/`，见第 4 节。
+四个手写 TTIR pass 在 `libtriton.so` 和 `build/bin/triton-opt` 里都能用同名 flag 调用。`CUDABackend.make_ttir` 不跑它们。lesson kernel 用 `choose_gemm_tile` 的 `BLOCK_*`，由这份 `.so` 经 TTGIR 到 `mma.sync.aligned.m8n8k4`，见 [`docs/triton_mlir_path.md`](docs/triton_mlir_path.md) 第 3.3 节。`tl.chip_rcp` 见第 3.5 节。
 
 [`tests/shell/run_tt_opt_tests.sh`](tests/shell/run_tt_opt_tests.sh) 执行 `tests/tt/*.mlir` 里的 `// RUN:`。它先把单词 `tt-opt` 换成 `python -m triton_llm.tt_opt`，再把 `TT_OPT_CPP` 换成 `build/bin/triton-opt`。手写 pass 的测试要写 `TT_OPT_CPP`。新增 pass 怎样同时进 `.so` 和 `triton-opt`，见 [`docs/triton_mlir_path.md`](docs/triton_mlir_path.md) 第 4 节。
 

@@ -9,7 +9,7 @@ TTIR 是 `tt` 方言，TTGIR 是 `triton_gpu` 方言。本仓库走 Triton 自�
 | 1 | `triton` 和 `triton_llm` 两个包的区别和安装；`libtriton.so` 怎么编出来 |
 | 2 | 这个 `.so` 何时加载，`@triton.jit` 的哪几行调用它 |
 | 3 | 从 Python 函数到 cubin：建 op、TTIR pass、tile、`tl.chip_rcp` |
-| 4 | `triton-opt` 与 `libtriton.so` 共用同一份 C++，以及换成自己的 GPU backend |
+| 4 | `triton-opt` 与 `libtriton.so` 共用同一份 C++ |
 | 5 | 按这个顺序运行 |
 | 6 | 主要入口函数 |
 
@@ -25,7 +25,7 @@ source .venv/bin/activate
 
 | | `triton` | `triton_llm` |
 |---|---|---|
-| 是什么 | Triton 编译器：DSL（`triton.language`）、编译流水线（`triton.compiler`）、运行时（`triton.runtime`）、C++ 扩展 `triton._C.libtriton` | 本仓库的代码：kernel、`tt_opt` 驱动、`fakegpu` backend |
+| 是什么 | Triton 编译器：DSL（`triton.language`）、编译流水线（`triton.compiler`）、运行时（`triton.runtime`）、C++ 扩展 `triton._C.libtriton` | 本仓库的代码：kernel、`tt_opt` 驱动 |
 | 源码目录 | `build/triton-src/python`，即 submodule `third_party/triton` 打过补丁后的副本 | 本仓库的 `python/triton_llm` |
 | 安装命令 | `pip install -e build/triton-src/python --no-build-isolation --no-deps` | `pip install --no-deps -e .`（在仓库根目录） |
 | 谁执行 | [`scripts/build_libtriton.sh`](../scripts/build_libtriton.sh)，由 `setup_venv.sh` 第一步调用 | `setup_venv.sh` 第二步 |
@@ -290,11 +290,11 @@ ptxBuilder.create<PTXInstr>("rcp")->o("approx").o("ftz").o("f32");
 
 `PTXInstr` 的第一个参数是 opcode，后面每个 `.o(...)` 是一个点号修饰符，拼出来是 `rcp.approx.ftz.f32`。`rcp` 是 PTX 的倒数，`.approx` 是近似，`.ftz` 把次正规数刷成 0，`.f32` 和这个函数只接受 fp32 一致。f32 的 `rcp.approx` 带 `.ftz`，`ptxas` 才接受这条指令。
 
-`ChipRcpOpConversion` 写在 `ElementwiseOpToLLVM.cpp`，由 `add_to_llvmir` 调用，接法和 `tl.exp` 相同。opcode 用 PTX 已有的 `rcp`。换一套指令集时换 backend，见第 4 节。
+`ChipRcpOpConversion` 写在 `ElementwiseOpToLLVM.cpp`，由 `add_to_llvmir` 调用，接法和 `tl.exp` 相同。opcode 用 PTX 已有的 `rcp`。
 
 `test_chip_rcp_lowers_through_ttgir_to_cubin` 检查：`ttir` 和 `ttgir` 里有 `tt.chip_rcp`，`llir` 和 `ptx` 里有 `rcp.approx.ftz.f32`，cubin 非空。
 
-## 4. `triton-opt`，以及换成自己的 GPU backend
+## 4. `triton-opt`
 
 1.2 节那次 pip 安装里的 cmake，把同一份 pass 的 `.cpp` 链进 `libtriton.so` 和 `build/bin/triton-opt`。官方 wheel 不带 `triton-opt`。仓库根目录的 cmake 不参与。
 
@@ -306,28 +306,6 @@ ptxBuilder.create<PTXInstr>("rcp")->o("approx").o("ftz").o("f32");
 4. 把改动写成补丁，再跑 `scripts/build_libtriton.sh`。`@triton.jit` 要跑到它，还得在 `make_ttir` 或 `make_ttgir` 里调用这个 `add_*`，见第 3.2 节。
 
 `tests/tt/` 里的 `// RUN:` 指定用哪个程序跑这条测试。`tests/shell/run_tt_opt_tests.sh` 把其中的 `tt-opt` 换成 `python -m triton_llm.tt_opt`，把 `TT_OPT_CPP` 换成 `build/bin/triton-opt`。
-
-芯片厂商如果沿用 Triton 的 Python 前端，`@triton.jit` 的写法可以保留。要替换的是 backend：在 `BaseBackend.add_stages` 里换成自己的 pass 顺序，用 `DriverBase` 在自己的设备上启动 kernel。NVIDIA 在 `TritonToTritonGPUPass.cpp` 和 `TritonGPUToLLVM.cpp` 的前面和后面插入 pass。换成另一种 GPU 时，才需要自己的 GPU dialect，以及降到自己指令集的 lowering。
-
-[`python/triton_llm/backend/fakegpu/`](../python/triton_llm/backend/fakegpu/) 里的 `FakeGPUBackend` 实现了上述两个接口。`FakeGPUDriver.is_active()` 返回 false，因此 `import triton` 时 `_create_driver()` 仍然只构造 `CudaDriver`。`activate()` 调用 `driver.set_active(FakeGPUDriver())`，离开 `with` 时恢复原先的 driver。`_discover_backends()` 只扫描 `triton/backends/` 下的目录，所以 `register()` 把这个 backend 写入 `triton.backends.backends["fakegpu"]`。
-
-`FakeGPUBackend.add_stages` 的三个阶段：
-
-1. `ttir`：调用 `.so` 里的 `passes.ttir` / `passes.common`，顺序和第 3.2 节的默认顺序相同，不含 `--triton-annotate-dot-stages`、`--triton-fuse-dot-epilogue`、`--triton-lower-fused-dot-mul`、`--triton-tile-dot`。
-2. `fakeasm`：`lower_ttir` 按 TTIR 中 op 的出现顺序各写一条指令。`FAKE_OPCODES` 的对应是 `scf.for` → `fake.loop`，`tt.dot` → `fake.dot`，`tt.chip_rcp` → `fake.rcp.f32`。这张表的角色与 `ChipRcpOpConversion`、`DotOpToLLVM` 相同：op 到机器指令的映射。该阶段不建 `triton_gpu` dialect，也不调用 `llvm.translate_to_asm`。
-3. `fakegpu`：把这份文本编码成 `bytes`。`CompiledKernel.asm["fakegpu"]` 就是这些字节。
-
-`FakeGPUDriver.get_current_device` 返回 99，所以 `JITFunction` 把结果放进 `self.cache[99]`，和 CUDA 的 `self.cache[0]` 分开。`load_binary` 把字节原样返回，`FakeLauncher` 把网格记进 `LAUNCHES`。示例是 [`lesson.py`](../python/triton_llm/backend/fakegpu/lesson.py) 的 `_fake_gpu_lesson`：
-
-```python
-from triton_llm.backend.fakegpu.lesson import compile_fake_gpu_lesson
-
-kernel = compile_fake_gpu_lesson()
-print(kernel.asm["ttir"])
-print(kernel.asm["fakeasm"])
-```
-
-`tests/python/test_fake_gpu_backend.py` 检查 `ttir` 含 `tt.chip_rcp`、`scf.for`、`tt.dot`，且 `fakeasm` 中 `fake.loop`、`fake.load`、`fake.dot`、`fake.yield`、`fake.rcp.f32`、`fake.store` 按此顺序出现。接到真实设备时，`add_stages` 还要加入该设备的 dialect 转换和汇编，`DriverBase.load_binary` 在设备上加载二进制。`activate()` 之外，`@triton.jit` 使用 `CUDABackend`。
 
 ## 5. 命令
 
@@ -344,7 +322,6 @@ python -m triton_llm.tt_opt tests/tt/annotate_dot_stages.mlir --triton-annotate-
 
 pytest tests/python/test_frontend_middle.py
 pytest tests/python/test_own_libtriton.py
-pytest tests/python/test_fake_gpu_backend.py
 pytest tests/python/test_python_cpp_handoff.py
 pytest tests/python/test_so_handwritten_passes.py
 pytest tests/python/test_tile_table_sync.py
@@ -390,6 +367,3 @@ pytest tests/python/test_own_libtriton.py
 | kernel 里的切块从哪来 | `_frontend_lesson` 的 `for` / `tl.dot`；`choose_gemm_tile` | `python/triton_llm/compiler/lesson.py`、`python/triton_llm/arch/tiling.py` |
 | 命令行上的四条 TTIR 变换 | `createAnnotateDotStagesPass`、`gemmTileForSm` | `lib/Dialect/Triton/Transforms/AnnotateDotStages.cpp`、`FuseAndTileDot.cpp`（`0002`） |
 | 这四条变换怎么从 Python 调进 `.so` | `add_annotate_dot_stages` 等 | `python/src/passes.cc`（`0002`） |
-| 换成自己的 backend | `FakeGPUBackend.add_stages`、`lower_ttir`；`FakeGPUDriver.get_current_target` | `python/triton_llm/backend/fakegpu/compiler.py`、`driver.py` |
-
-`FAKE_OPCODES` 定义 op 到 `fake.*` 指令的映射，对应 C++ 里的 `ChipRcpOpConversion`。`FakeGPUBackend` 的最后一阶段把这些指令编码成字节，不调用 `ptxas`。

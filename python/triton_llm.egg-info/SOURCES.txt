@@ -12,11 +12,6 @@ python/triton_llm/arch/__init__.py
 python/triton_llm/arch/hopper.py
 python/triton_llm/arch/sm70.py
 python/triton_llm/arch/tiling.py
-python/triton_llm/backend/__init__.py
-python/triton_llm/backend/fakegpu/__init__.py
-python/triton_llm/backend/fakegpu/compiler.py
-python/triton_llm/backend/fakegpu/driver.py
-python/triton_llm/backend/fakegpu/lesson.py
 python/triton_llm/compiler/__init__.py
 python/triton_llm/compiler/frontend.py
 python/triton_llm/compiler/lesson.py
